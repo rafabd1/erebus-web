@@ -1,0 +1,8 @@
+/target/
+/data/
+**/node_modules/
+extension/dist/
+/.internal/
+*.log
+.env
+

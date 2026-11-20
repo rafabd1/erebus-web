@@ -1,0 +1,380 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde::Serialize;
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
+use uuid::Uuid;
+
+use crate::model::{
+    CaptureGapInput, HttpCaptureEvent, HttpIngestBatch, WebSocketFrameEvent, WebSocketIngestBatch,
+};
+use crate::proxy::{ProxyCapture, ProxyConfig, ProxyHandle, start_proxy};
+use crate::store::Store;
+
+const INGEST_BATCH_ITEMS: usize = 100;
+const INGEST_INTERVAL: Duration = Duration::from_millis(50);
+const SHUTDOWN_DRAIN_LIMIT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureProxyDescriptor {
+    pub url: String,
+    pub ca_endpoint: &'static str,
+}
+
+#[derive(Clone)]
+pub struct CaptureManager {
+    inner: Arc<CaptureManagerInner>,
+}
+
+struct CaptureManagerInner {
+    store: Arc<Store>,
+    proxy_data_dir: PathBuf,
+    active: Mutex<HashMap<String, ManagedProxy>>,
+}
+
+struct ManagedProxy {
+    descriptor: CaptureProxyDescriptor,
+    handle: ProxyHandle,
+    worker: JoinHandle<()>,
+}
+
+impl CaptureManager {
+    pub fn new(store: Arc<Store>, data_dir: &Path) -> Self {
+        Self {
+            inner: Arc::new(CaptureManagerInner {
+                store,
+                proxy_data_dir: data_dir.join("proxy"),
+                active: Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    pub async fn start(&self, session_id: &str) -> anyhow::Result<CaptureProxyDescriptor> {
+        let mut active = self.inner.active.lock().await;
+        if let Some(existing) = active.get(session_id) {
+            return Ok(existing.descriptor.clone());
+        }
+        let runtime = start_proxy(&self.inner.proxy_data_dir, ProxyConfig::default()).await?;
+        let expected_ca_path = self.inner.proxy_data_dir.join("proxy-ca.pem");
+        if runtime.handle.ca_certificate_path() != expected_ca_path {
+            anyhow::bail!("capture proxy returned an unexpected CA path");
+        }
+        let descriptor = CaptureProxyDescriptor {
+            url: format!("http://{}", runtime.handle.address()),
+            ca_endpoint: "/v1/proxy/ca",
+        };
+        let producer_id = format!("proxy-{}", Uuid::new_v4());
+        let worker = tokio::spawn(ingest_proxy_events(
+            self.inner.store.clone(),
+            session_id.to_owned(),
+            producer_id,
+            runtime.events,
+        ));
+        active.insert(
+            session_id.to_owned(),
+            ManagedProxy {
+                descriptor: descriptor.clone(),
+                handle: runtime.handle,
+                worker,
+            },
+        );
+        Ok(descriptor)
+    }
+
+    pub async fn descriptor(&self, session_id: &str) -> Option<CaptureProxyDescriptor> {
+        self.inner
+            .active
+            .lock()
+            .await
+            .get(session_id)
+            .map(|proxy| proxy.descriptor.clone())
+    }
+
+    pub async fn stop(&self, session_id: &str) -> anyhow::Result<()> {
+        let managed = self.inner.active.lock().await.remove(session_id);
+        let Some(managed) = managed else {
+            return Ok(());
+        };
+        let ManagedProxy {
+            handle, mut worker, ..
+        } = managed;
+        let dropped_events = handle.dropped_events();
+        let shutdown_result = handle.shutdown().await;
+        let drain_result = match tokio::time::timeout(SHUTDOWN_DRAIN_LIMIT, &mut worker).await {
+            Ok(result) => result.map_err(anyhow::Error::from),
+            Err(_) => {
+                worker.abort();
+                let _ = worker.await;
+                Err(anyhow::anyhow!("capture event drain timed out"))
+            }
+        };
+        if dropped_events > 0 {
+            tracing::warn!(%session_id, dropped_events, "capture proxy dropped events");
+            persist_gap(
+                self.inner.store.clone(),
+                session_id.to_owned(),
+                dropped_events,
+                "capture queue remained full while the proxy stopped".into(),
+            )
+            .await;
+        }
+        match (shutdown_result, drain_result) {
+            (Err(error), _) | (_, Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    pub async fn shutdown_all(&self) {
+        let session_ids = self
+            .inner
+            .active
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for session_id in session_ids {
+            if let Err(error) = self.stop(&session_id).await {
+                tracing::warn!(%session_id, %error, "failed to stop capture proxy cleanly");
+            }
+        }
+    }
+
+    pub async fn ca_certificate(&self) -> anyhow::Result<String> {
+        let path = self.inner.proxy_data_dir.join("proxy-ca.pem");
+        tokio::fs::read_to_string(&path)
+            .await
+            .map_err(anyhow::Error::from)
+    }
+}
+
+async fn ingest_proxy_events(
+    store: Arc<Store>,
+    session_id: String,
+    producer_id: String,
+    mut receiver: tokio::sync::mpsc::Receiver<ProxyCapture>,
+) {
+    let mut http = Vec::<HttpCaptureEvent>::new();
+    let mut websocket = Vec::<WebSocketFrameEvent>::new();
+    let mut interval = tokio::time::interval(INGEST_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        if http.len() >= INGEST_BATCH_ITEMS || websocket.len() >= INGEST_BATCH_ITEMS {
+            if flush_pending(&store, &session_id, &producer_id, &mut http, &mut websocket)
+                .await
+                .is_err()
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            continue;
+        }
+        tokio::select! {
+            event = receiver.recv() => {
+                match event {
+                    Some(ProxyCapture::Http(event)) => http.push(event),
+                    Some(ProxyCapture::WebSocket(event)) => websocket.push(event),
+                    Some(ProxyCapture::Gap(gap)) => {
+                        let input = CaptureGapInput {
+                            session_id: session_id.clone(),
+                            source: "proxy".into(),
+                            dropped_events: gap.dropped_events,
+                            reason: gap.reason.into(),
+                            observed_at: None,
+                        };
+                        let store = store.clone();
+                        match tokio::task::spawn_blocking(move || store.record_gap(input)).await {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => tracing::warn!(%error, "capture gap was not stored"),
+                            Err(error) => tracing::warn!(%error, "capture gap writer task failed"),
+                        }
+                    }
+                    None => break,
+                }
+            }
+            _ = interval.tick() => {
+                if let Err(error) = flush_pending(
+                    &store,
+                    &session_id,
+                    &producer_id,
+                    &mut http,
+                    &mut websocket,
+                ).await {
+                    tracing::warn!(%session_id, %error, "capture event batch was not stored yet");
+                }
+            }
+        }
+    }
+
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_DRAIN_LIMIT;
+    while (!http.is_empty() || !websocket.is_empty()) && tokio::time::Instant::now() < deadline {
+        if flush_pending(&store, &session_id, &producer_id, &mut http, &mut websocket)
+            .await
+            .is_err()
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    if !http.is_empty() || !websocket.is_empty() {
+        tracing::error!(
+            %session_id,
+            http_events = http.len(),
+            websocket_events = websocket.len(),
+            "capture events remained after the shutdown drain limit"
+        );
+    }
+}
+
+async fn flush_pending(
+    store: &Arc<Store>,
+    session_id: &str,
+    producer_id: &str,
+    http: &mut Vec<HttpCaptureEvent>,
+    websocket: &mut Vec<WebSocketFrameEvent>,
+) -> anyhow::Result<()> {
+    if !http.is_empty() {
+        let events = http.clone();
+        let ingest_store = store.clone();
+        let batch = HttpIngestBatch {
+            producer_id: producer_id.to_owned(),
+            session_id: session_id.to_owned(),
+            events,
+        };
+        let results =
+            tokio::task::spawn_blocking(move || ingest_store.ingest_http(batch)).await??;
+        let rejected = report_rejections(session_id, "HTTP", &results);
+        http.clear();
+        if rejected > 0 {
+            persist_gap(
+                store.clone(),
+                session_id.to_owned(),
+                rejected as u64,
+                "proxy HTTP events were rejected by the traffic store".into(),
+            )
+            .await;
+        }
+    }
+    if !websocket.is_empty() {
+        let frames = websocket.clone();
+        let ingest_store = store.clone();
+        let batch = WebSocketIngestBatch {
+            producer_id: producer_id.to_owned(),
+            session_id: session_id.to_owned(),
+            frames,
+        };
+        let results =
+            tokio::task::spawn_blocking(move || ingest_store.ingest_websocket(batch)).await??;
+        let rejected = report_rejections(session_id, "WebSocket", &results);
+        websocket.clear();
+        if rejected > 0 {
+            persist_gap(
+                store.clone(),
+                session_id.to_owned(),
+                rejected as u64,
+                "proxy WebSocket events were rejected by the traffic store".into(),
+            )
+            .await;
+        }
+    }
+    Ok(())
+}
+
+async fn persist_gap(store: Arc<Store>, session_id: String, dropped_events: u64, reason: String) {
+    let input = CaptureGapInput {
+        session_id,
+        source: "proxy".into(),
+        dropped_events,
+        reason,
+        observed_at: None,
+    };
+    match tokio::task::spawn_blocking(move || store.record_gap(input)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => tracing::warn!(%error, "capture gap was not stored"),
+        Err(error) => tracing::warn!(%error, "capture gap writer task failed"),
+    }
+}
+
+fn report_rejections(
+    session_id: &str,
+    kind: &str,
+    results: &[crate::model::IngestResult],
+) -> usize {
+    let rejected = results
+        .iter()
+        .filter(|result| matches!(result.status, crate::model::IngestStatus::Rejected))
+        .count();
+    if rejected > 0 {
+        tracing::warn!(%session_id, kind, rejected, "proxy capture events were rejected");
+    }
+    rejected
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{CreateSession, TrafficQuery};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    #[tokio::test]
+    async fn proxy_session_forwards_and_persists_into_its_capture_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(temp.path()).unwrap());
+        let session = store
+            .create_session(CreateSession {
+                label: "proxy".into(),
+                source: "proxy".into(),
+                scope_profile_id: None,
+            })
+            .unwrap();
+        let manager = CaptureManager::new(store.clone(), temp.path());
+        let proxy = manager.start(&session.id).await.unwrap();
+        let proxy_address = proxy.url.strip_prefix("http://").unwrap();
+
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_address = origin.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            let (mut stream, _) = origin.accept().await.unwrap();
+            let mut request = [0_u8; 2_048];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(proxy_address).await.unwrap();
+        client
+            .write_all(
+                format!(
+                    "GET http://{origin_address}/account HTTP/1.1\r\nHost: {origin_address}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(String::from_utf8_lossy(&response).contains("200 OK"));
+        origin_task.await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let page = store
+                    .traffic(TrafficQuery {
+                        session_id: Some(session.id.clone()),
+                        ..TrafficQuery::default()
+                    })
+                    .unwrap();
+                if page.items.len() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        manager.stop(&session.id).await.unwrap();
+    }
+}

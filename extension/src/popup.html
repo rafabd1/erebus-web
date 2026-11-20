@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Erebus Web Capture</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>Erebus capture</h1>
+          <p>Capture only the tab you choose.</p>
+        </div>
+        <span id="connection" class="badge">Not paired</span>
+      </header>
+
+      <section class="card" aria-labelledby="pairing-heading">
+        <h2 id="pairing-heading">Runtime</h2>
+        <label>
+          Local URL
+          <input id="server-url" type="url" placeholder="http://127.0.0.1:8789" spellcheck="false" />
+        </label>
+        <label>
+          Token
+          <input id="token" type="password" autocomplete="off" spellcheck="false" />
+        </label>
+        <label>
+          Capture session
+          <input id="session-id" type="text" spellcheck="false" />
+        </label>
+        <button id="save" type="button" class="secondary">Save pairing</button>
+        <p id="pairing-lock" class="detail" hidden></p>
+      </section>
+
+      <section class="card" aria-labelledby="capture-heading">
+        <div class="section-row">
+          <h2 id="capture-heading">Current tab</h2>
+          <span id="tab-status" class="status">Idle</span>
+        </div>
+        <div class="actions">
+          <button id="start" type="button">Start capture</button>
+          <button id="stop" type="button" class="secondary">Stop</button>
+        </div>
+        <p id="tab-detail" class="detail">No selected tab is being captured.</p>
+      </section>
+
+      <section class="queue" aria-live="polite">
+        <span><strong id="queued">0</strong> queued</span>
+        <span><strong id="failed">0</strong> rejected</span>
+        <button id="flush" type="button" class="link">Send now</button>
+        <button id="discard" type="button" class="link danger">Discard queued</button>
+      </section>
+      <p id="error" class="error" hidden></p>
+    </main>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>
+
