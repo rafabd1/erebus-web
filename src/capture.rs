@@ -5,12 +5,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tokio::sync::Mutex;
 use tokio::task::{JoinHandle, JoinSet};
 use uuid::Uuid;
 
 use crate::model::{
-    CaptureGapInput, HttpCaptureEvent, HttpIngestBatch, WebSocketFrameEvent, WebSocketIngestBatch,
+    CaptureGapInput, HttpCaptureEvent, HttpIngestBatch, IngestResult, IngestStatus,
+    WebSocketFrameEvent, WebSocketIngestBatch,
 };
 use crate::proxy::{
     ProxyCapture, ProxyConfig, ProxyHandle, UpstreamTlsConfig, atomic_write, start_proxy,
@@ -372,18 +375,41 @@ async fn flush_pending(
         let batch = HttpIngestBatch {
             producer_id: producer_id.to_owned(),
             session_id: session_id.to_owned(),
-            events,
+            events: events.clone(),
         };
         let results =
             tokio::task::spawn_blocking(move || ingest_store.ingest_http(batch)).await??;
-        let rejected = report_rejections(session_id, "HTTP", &results);
+        let rejected_events = events
+            .iter()
+            .zip(&results)
+            .filter(|(_, result)| matches!(result.status, IngestStatus::Rejected))
+            .map(|(event, _)| event.clone())
+            .collect::<Vec<_>>();
+        let rejected_results = if rejected_events.is_empty() {
+            Vec::new()
+        } else {
+            tokio::task::yield_now().await;
+            let retry_store = store.clone();
+            let retry = HttpIngestBatch {
+                producer_id: producer_id.to_owned(),
+                session_id: session_id.to_owned(),
+                events: rejected_events,
+            };
+            tokio::task::spawn_blocking(move || retry_store.ingest_http(retry)).await??
+        };
         http.clear();
-        if rejected > 0 {
-            persist_gap(
+        if let Some(rejection) = rejection_summary("HTTP", &rejected_results) {
+            tracing::warn!(
+                %session_id,
+                rejected = rejection.count,
+                reason = %rejection.reason,
+                "proxy capture events were rejected after retry"
+            );
+            persist_rejection_gap(
                 store.clone(),
                 session_id.to_owned(),
-                rejected as u64,
-                "proxy HTTP events were rejected by the traffic store".into(),
+                producer_id.to_owned(),
+                rejection,
             )
             .await;
         }
@@ -394,18 +420,41 @@ async fn flush_pending(
         let batch = WebSocketIngestBatch {
             producer_id: producer_id.to_owned(),
             session_id: session_id.to_owned(),
-            frames,
+            frames: frames.clone(),
         };
         let results =
             tokio::task::spawn_blocking(move || ingest_store.ingest_websocket(batch)).await??;
-        let rejected = report_rejections(session_id, "WebSocket", &results);
+        let rejected_frames = frames
+            .iter()
+            .zip(&results)
+            .filter(|(_, result)| matches!(result.status, IngestStatus::Rejected))
+            .map(|(frame, _)| frame.clone())
+            .collect::<Vec<_>>();
+        let rejected_results = if rejected_frames.is_empty() {
+            Vec::new()
+        } else {
+            tokio::task::yield_now().await;
+            let retry_store = store.clone();
+            let retry = WebSocketIngestBatch {
+                producer_id: producer_id.to_owned(),
+                session_id: session_id.to_owned(),
+                frames: rejected_frames,
+            };
+            tokio::task::spawn_blocking(move || retry_store.ingest_websocket(retry)).await??
+        };
         websocket.clear();
-        if rejected > 0 {
-            persist_gap(
+        if let Some(rejection) = rejection_summary("WebSocket", &rejected_results) {
+            tracing::warn!(
+                %session_id,
+                rejected = rejection.count,
+                reason = %rejection.reason,
+                "proxy capture events were rejected after retry"
+            );
+            persist_rejection_gap(
                 store.clone(),
                 session_id.to_owned(),
-                rejected as u64,
-                "proxy WebSocket events were rejected by the traffic store".into(),
+                producer_id.to_owned(),
+                rejection,
             )
             .await;
         }
@@ -430,25 +479,72 @@ async fn persist_gap(store: Arc<Store>, session_id: String, dropped_events: u64,
     }
 }
 
-fn report_rejections(
-    session_id: &str,
-    kind: &str,
-    results: &[crate::model::IngestResult],
-) -> usize {
+#[derive(Debug)]
+struct RejectionSummary {
+    count: usize,
+    first_sequence: Option<u64>,
+    reason: String,
+}
+
+fn rejection_summary(kind: &str, results: &[IngestResult]) -> Option<RejectionSummary> {
     let rejected = results
         .iter()
-        .filter(|result| matches!(result.status, crate::model::IngestStatus::Rejected))
-        .count();
-    if rejected > 0 {
-        tracing::warn!(%session_id, kind, rejected, "proxy capture events were rejected");
+        .filter(|result| matches!(result.status, IngestStatus::Rejected))
+        .collect::<Vec<_>>();
+    if rejected.is_empty() {
+        return None;
     }
-    rejected
+    let details = rejected
+        .iter()
+        .take(4)
+        .map(|result| {
+            let error = result
+                .error
+                .as_deref()
+                .unwrap_or("traffic store did not provide a reason")
+                .replace(['\r', '\n'], " ");
+            let bounded = error.chars().take(300).collect::<String>();
+            format!("sequence {}: {bounded}", result.sequence)
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(RejectionSummary {
+        count: rejected.len(),
+        first_sequence: rejected.first().map(|result| result.sequence),
+        reason: format!("proxy {kind} events were rejected after one retry: {details}"),
+    })
+}
+
+async fn persist_rejection_gap(
+    store: Arc<Store>,
+    session_id: String,
+    producer_id: String,
+    rejection: RejectionSummary,
+) {
+    let input = CaptureGapInput {
+        session_id,
+        source: "proxy".into(),
+        dropped_events: rejection.count as u64,
+        reason: rejection.reason,
+        observed_at: Some(
+            OffsetDateTime::now_utc()
+                .format(&Rfc3339)
+                .expect("RFC 3339 formatting is supported"),
+        ),
+        producer_id: Some(producer_id),
+        sequence: rejection.first_sequence,
+    };
+    match tokio::task::spawn_blocking(move || store.record_gap(input)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => tracing::warn!(%error, "capture rejection gap was not stored"),
+        Err(error) => tracing::warn!(%error, "capture rejection gap writer task failed"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CaptureGapQuery, CreateSession, TrafficQuery};
+    use crate::model::{CaptureGapQuery, CapturedRequest, CreateSession, TrafficQuery};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     #[tokio::test]
@@ -638,6 +734,60 @@ mod tests {
             gaps[0].reason,
             "capture events remained after the shutdown drain limit"
         );
+    }
+
+    #[tokio::test]
+    async fn rejected_proxy_events_are_retried_and_keep_the_store_reason() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(temp.path()).unwrap());
+        let session = store
+            .create_session(CreateSession {
+                label: "rejection".into(),
+                source: "proxy".into(),
+                scope_profile_id: None,
+            })
+            .unwrap();
+        let mut http = vec![HttpCaptureEvent {
+            sequence: 5,
+            captured_at: None,
+            duration_ms: None,
+            request: CapturedRequest {
+                method: "POST".into(),
+                url: "not a URL".into(),
+                headers: Vec::new(),
+                body: None,
+            },
+            response: None,
+            error: None,
+            tab_id: None,
+            initiator: None,
+            parent_sequence: None,
+            metadata: serde_json::json!({}),
+        }];
+        let mut websocket = Vec::new();
+
+        flush_pending(
+            &store,
+            &session.id,
+            "proxy-rejection-test",
+            &mut http,
+            &mut websocket,
+        )
+        .await
+        .unwrap();
+
+        assert!(http.is_empty());
+        let gaps = store
+            .capture_gaps(CaptureGapQuery {
+                session_id: Some(session.id),
+                limit: None,
+            })
+            .unwrap();
+        assert_eq!(gaps.len(), 1);
+        assert!(gaps[0].id.starts_with("gap-"));
+        assert!(gaps[0].reason.contains("sequence 5"));
+        assert!(gaps[0].reason.contains("request URL is invalid"));
+        assert!(gaps[0].reason.contains("after one retry"));
     }
 
     #[tokio::test]

@@ -65,7 +65,8 @@ impl AppState {
         let permit = self
             .blocking_slots
             .clone()
-            .try_acquire_owned()
+            .acquire_owned()
+            .await
             .map_err(|_| AppError::Busy)?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
@@ -866,7 +867,8 @@ mod tests {
     use tower::ServiceExt as _;
 
     use super::{
-        AppState, NeighborhoodQuery, PairingResolution, PairingTokens, constant_time_eq, router,
+        AppState, MAX_BLOCKING_TASKS, NeighborhoodQuery, PairingResolution, PairingTokens,
+        constant_time_eq, router,
     };
     use crate::config::Config;
     use crate::model::CreateSession;
@@ -886,6 +888,32 @@ mod tests {
 
         assert!(!graph.in_scope_only);
         assert!(!neighborhood.in_scope_only);
+    }
+
+    #[tokio::test]
+    async fn blocking_work_waits_for_capacity_instead_of_returning_busy() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            data_dir: temp.path().to_path_buf(),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token: Some("master-token".into()),
+        }
+        .prepare()
+        .unwrap();
+        let state = AppState::new(config, Arc::new(Store::open(temp.path()).unwrap()));
+        let held = state
+            .blocking_slots
+            .clone()
+            .acquire_many_owned(MAX_BLOCKING_TASKS as u32)
+            .await
+            .unwrap();
+        let queued_state = state.clone();
+        let queued = tokio::spawn(async move { queued_state.run_blocking(|| Ok(7_u8)).await });
+
+        tokio::task::yield_now().await;
+        assert!(!queued.is_finished());
+        drop(held);
+        assert_eq!(queued.await.unwrap().unwrap(), 7);
     }
 
     #[tokio::test]
