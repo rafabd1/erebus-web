@@ -93,12 +93,10 @@ function render(state: ExtensionState): void {
   queued.textContent = String(state.queued);
   failed.textContent = String(state.deadLetters);
   buttons.discard.disabled = state.queued === 0;
-  serverUrl.disabled = state.pairingLocked;
   sessionId.disabled = state.pairingLocked;
-  pairingRecord.disabled = state.pairingLocked;
   pairingLock.hidden = !state.pairingLocked;
   pairingLock.textContent = state.pairingLocked
-    ? "Runtime and session stay locked while capture is active or events are queued. The token can still be updated."
+    ? "The capture session stays locked while capture is active or events are queued. Runtime address and token can still be updated."
     : "";
 
   const active = state.tabs.find((tab) => tab.status === "capturing") ?? state.tabs[0];
@@ -138,9 +136,7 @@ function setBusy(busy: boolean): void {
     const active = latestState.tabs.find((tab) => tab.status === "capturing") ?? latestState.tabs[0];
     buttons.stop.disabled = !active;
     buttons.discard.disabled = latestState.queued === 0;
-    serverUrl.disabled = latestState.pairingLocked;
     sessionId.disabled = latestState.pairingLocked;
-    pairingRecord.disabled = latestState.pairingLocked;
   }
 }
 

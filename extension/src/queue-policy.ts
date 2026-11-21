@@ -1,4 +1,4 @@
-import type { QueueItem, QueueTarget } from "./protocol";
+import type { QueueItem, QueueKind, QueueTarget, RuntimeConfig } from "./protocol";
 
 export const MAX_BATCH_ITEMS = 50;
 export const MAX_BATCH_BYTES = 12 * 1024 * 1024;
@@ -12,11 +12,28 @@ export function queueTarget(config: QueueTarget): QueueTarget {
 }
 
 export function sameTarget(left: QueueTarget, right: QueueTarget): boolean {
-  return (
-    left.serverUrl === right.serverUrl &&
-    left.sessionId === right.sessionId &&
-    left.producerId === right.producerId
-  );
+  return left.sessionId === right.sessionId && left.producerId === right.producerId;
+}
+
+export function deliveryUrl(config: Pick<RuntimeConfig, "serverUrl">, path: string): string {
+  return `${config.serverUrl}${path}`;
+}
+
+export function deliveryPath(kind: QueueKind): string {
+  return kind === "http" ? "/v1/ingest/http" : kind === "ws" ? "/v1/ingest/ws" : "/v1/gaps";
+}
+
+export function reboundConfig(
+  current: RuntimeConfig | undefined,
+  proposed: Pick<RuntimeConfig, "serverUrl" | "token" | "sessionId">,
+  producerId: () => string
+): RuntimeConfig {
+  const sameSession = current?.sessionId === proposed.sessionId;
+  return {
+    ...proposed,
+    producerId: sameSession ? current.producerId : producerId(),
+    nextSequence: sameSession ? current.nextSequence : 1
+  };
 }
 
 export function selectBatch(
@@ -44,5 +61,5 @@ export function pairingChangeAllowed(
   locked: boolean
 ): boolean {
   if (!current || !locked) return true;
-  return current.serverUrl === proposed.serverUrl && current.sessionId === proposed.sessionId;
+  return current.sessionId === proposed.sessionId;
 }

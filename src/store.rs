@@ -107,6 +107,9 @@ impl Store {
             }
         };
         let blobs = BlobStore::new(data_dir)?;
+        if !fts_enabled {
+            backfill_fallback_search(&mut connection, &blobs)?;
+        }
         maintain_blobs(&mut connection, &blobs, ORPHAN_BLOB_GRACE)?;
         Ok(Self {
             database_path,
@@ -126,8 +129,10 @@ impl Store {
             return Err(invalid("session label cannot be empty"));
         }
         let scope_profile_id = input.scope_profile_id.unwrap_or_else(|| "default".into());
-        let connection = self.writer()?;
-        let exists = connection
+        let mut connection = self.writer()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let exists = transaction
             .query_row(
                 "SELECT 1 FROM scope_profiles WHERE id = ?1",
                 [&scope_profile_id],
@@ -140,6 +145,24 @@ impl Store {
                 "scope profile {scope_profile_id} does not exist"
             )));
         }
+        let browser_source = input.source.starts_with("browser:");
+        if browser_source {
+            let active = transaction
+                .query_row(
+                    "SELECT 1 FROM capture_sessions
+                     WHERE source = ?1 AND ended_at IS NULL",
+                    [&input.source],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if active {
+                return Err(invalid(format!(
+                    "active capture session already exists for source {}",
+                    input.source
+                )));
+            }
+        }
         let session = CaptureSession {
             id: Uuid::now_v7().to_string(),
             label: label.into(),
@@ -148,7 +171,7 @@ impl Store {
             ended_at: None,
             scope_profile_id,
         };
-        connection.execute(
+        let inserted = transaction.execute(
             "INSERT INTO capture_sessions(id, label, source, started_at, scope_profile_id)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -158,7 +181,19 @@ impl Store {
                 session.started_at,
                 session.scope_profile_id
             ],
-        )?;
+        );
+        if let Err(error) = inserted {
+            if browser_source
+                && error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation)
+            {
+                return Err(invalid(format!(
+                    "active capture session already exists for source {}",
+                    session.source
+                )));
+            }
+            return Err(error.into());
+        }
+        transaction.commit()?;
         Ok(session)
     }
 
@@ -570,9 +605,9 @@ impl Store {
             values.push(captured_at.into());
             values.push(id.into());
         }
-        if let Some(host) = query.host {
-            sql.push_str(" AND req.host = ?");
-            values.push(host.to_ascii_lowercase().into());
+        if let Some(host) = query.host.filter(|value| !value.trim().is_empty()) {
+            sql.push_str(" AND LOWER(req.host) LIKE ? ESCAPE '\\'");
+            values.push(format!("%{}%", escape_like(&host.trim().to_ascii_lowercase())).into());
         }
         if let Some(method) = query.method {
             sql.push_str(" AND req.method = ?");
@@ -615,9 +650,16 @@ impl Store {
                 values.push(like.into());
             } else {
                 sql.push_str(
-                    " AND (req.url LIKE ? ESCAPE '\\' OR req.headers_json LIKE ? ESCAPE '\\')",
+                    " AND EXISTS (
+                        SELECT 1 FROM traffic_search_fallback f
+                        WHERE f.observation_id = o.id
+                          AND (f.url LIKE ? ESCAPE '\\'
+                            OR f.headers LIKE ? ESCAPE '\\'
+                            OR f.body_preview LIKE ? ESCAPE '\\')
+                    )",
                 );
                 let like = format!("%{}%", escape_like(&text));
+                values.push(like.clone().into());
                 values.push(like.clone().into());
                 values.push(like.into());
             }
@@ -691,23 +733,47 @@ impl Store {
         if let Some(text) = query.text.filter(|value| !value.trim().is_empty()) {
             if self.fts_enabled && text.chars().count() >= 3 {
                 sql.push_str(
-                    " AND EXISTS (
-                        SELECT 1 FROM websocket_fts wf
-                        WHERE wf.event_id = we.id AND websocket_fts MATCH ?
-                    )",
+                    " AND (wc.url LIKE ? ESCAPE '\\'
+                        OR wc.subprotocol LIKE ? ESCAPE '\\'
+                        OR wc.close_reason LIKE ? ESCAPE '\\'
+                        OR we.error LIKE ? ESCAPE '\\'
+                        OR EXISTS (
+                            SELECT 1 FROM websocket_fts wf
+                            WHERE wf.event_id = we.id AND websocket_fts MATCH ?
+                        ))",
                 );
+                let like = format!("%{}%", escape_like(&text));
+                values.push(like.clone().into());
+                values.push(like.clone().into());
+                values.push(like.clone().into());
+                values.push(like.into());
                 values.push(format!("\"{}\"", text.replace('"', "\"\"")).into());
             } else if self.fts_enabled {
                 sql.push_str(
+                    " AND (wc.url LIKE ? ESCAPE '\\'
+                        OR wc.subprotocol LIKE ? ESCAPE '\\'
+                        OR wc.close_reason LIKE ? ESCAPE '\\'
+                        OR we.error LIKE ? ESCAPE '\\'
+                        OR EXISTS (
+                            SELECT 1 FROM websocket_fts wf
+                            WHERE wf.event_id = we.id AND wf.payload LIKE ? ESCAPE '\\'
+                        ))",
+                );
+                let like = format!("%{}%", escape_like(&text));
+                for _ in 0..5 {
+                    values.push(like.clone().into());
+                }
+            } else {
+                sql.push_str(
                     " AND EXISTS (
-                        SELECT 1 FROM websocket_fts wf
-                        WHERE wf.event_id = we.id AND wf.payload LIKE ? ESCAPE '\\'
+                        SELECT 1 FROM websocket_search_fallback sf
+                        WHERE sf.event_id = we.id
+                          AND (sf.url LIKE ? ESCAPE '\\' OR sf.payload LIKE ? ESCAPE '\\')
                     )",
                 );
-                values.push(format!("%{}%", escape_like(&text)).into());
-            } else {
-                sql.push_str(" AND wc.url LIKE ? ESCAPE '\\'");
-                values.push(format!("%{}%", escape_like(&text)).into());
+                let like = format!("%{}%", escape_like(&text));
+                values.push(like.clone().into());
+                values.push(like.into());
             }
         }
         sql.push_str(" ORDER BY we.captured_at DESC, we.id DESC LIMIT ?");
@@ -773,6 +839,34 @@ impl Store {
         if reason.is_empty() || reason.len() > 2_048 {
             return Err(invalid("capture gap reason must contain 1 to 2048 bytes"));
         }
+        let id = match (input.producer_id.as_deref(), input.sequence) {
+            (Some(producer_id), Some(sequence)) => {
+                let producer_id = producer_id.trim();
+                if producer_id.is_empty() || producer_id.len() > 128 {
+                    return Err(invalid(
+                        "capture gap producer ID must contain 1 to 128 bytes",
+                    ));
+                }
+                if input.observed_at.is_none() {
+                    return Err(invalid(
+                        "idempotent capture gaps must include their observed time",
+                    ));
+                }
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(input.session_id.as_bytes());
+                hasher.update(&[0]);
+                hasher.update(producer_id.as_bytes());
+                hasher.update(&[0]);
+                hasher.update(&sequence.to_be_bytes());
+                format!("gap-{}", hasher.finalize().to_hex())
+            }
+            (None, None) => Uuid::now_v7().to_string(),
+            _ => {
+                return Err(invalid(
+                    "capture gap producer ID and sequence must be supplied together",
+                ));
+            }
+        };
         let observed_at = normalized_time(input.observed_at.as_deref())?;
         let connection = self.writer()?;
         let session_exists = connection
@@ -790,13 +884,38 @@ impl Store {
             )));
         }
         let gap = CaptureGap {
-            id: Uuid::now_v7().to_string(),
+            id,
             session_id: input.session_id,
             source: source.into(),
             dropped_events: input.dropped_events,
             reason: reason.into(),
             observed_at,
         };
+        let existing = connection
+            .query_row(
+                "SELECT id, session_id, source, dropped_events, reason, observed_at
+                 FROM capture_gaps WHERE id = ?1",
+                [&gap.id],
+                |row| {
+                    Ok(CaptureGap {
+                        id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        source: row.get(2)?,
+                        dropped_events: row.get::<_, i64>(3)? as u64,
+                        reason: row.get(4)?,
+                        observed_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            if existing == gap {
+                return Ok(existing);
+            }
+            return Err(invalid(
+                "capture gap sequence was already used for different content",
+            ));
+        }
         connection.execute(
             "INSERT INTO capture_gaps(
                 id, session_id, source, dropped_events, reason, observed_at
@@ -1074,8 +1193,13 @@ impl Store {
             .as_deref()
             .filter(|value| !value.trim().is_empty())
         {
-            sql.push_str(" AND (n.label LIKE ? ESCAPE '\\' OR n.canonical_key LIKE ? ESCAPE '\\')");
-            let like = format!("%{}%", escape_like(text));
+            sql.push_str(
+                " AND (LOWER(n.label) LIKE ? ESCAPE '\\'
+                    OR LOWER(n.canonical_key) LIKE ? ESCAPE '\\'
+                    OR LOWER(n.metadata_json) LIKE ? ESCAPE '\\')",
+            );
+            let like = format!("%{}%", escape_like(&text.trim().to_ascii_lowercase()));
+            values.push(like.clone().into());
             values.push(like.clone().into());
             values.push(like.into());
         }
@@ -1487,25 +1611,27 @@ impl Store {
                 event_fingerprint
             ],
         )?;
+        let body_preview = index_preview(&request_body, &response_body);
+        let headers = format!(
+            "{}\n{}",
+            headers_text(&event.request.headers),
+            event
+                .response
+                .as_ref()
+                .map(|response| headers_text(&response.headers))
+                .unwrap_or_default()
+        );
         if self.fts_enabled {
-            let body_preview = index_preview(&request_body, &response_body);
             transaction.execute(
                 "INSERT INTO traffic_fts(observation_id, url, headers, body_preview)
                  VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    observation_id,
-                    event.request.url,
-                    format!(
-                        "{}\n{}",
-                        headers_text(&event.request.headers),
-                        event
-                            .response
-                            .as_ref()
-                            .map(|response| headers_text(&response.headers))
-                            .unwrap_or_default()
-                    ),
-                    body_preview
-                ],
+                params![observation_id, event.request.url, headers, body_preview],
+            )?;
+        } else {
+            transaction.execute(
+                "INSERT INTO traffic_search_fallback(observation_id, url, headers, body_preview)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![observation_id, event.request.url, headers, body_preview],
             )?;
         }
         graph::project_http(
@@ -1682,15 +1808,24 @@ impl Store {
                 event_fingerprint
             ],
         )?;
+        let text = payload
+            .bytes
+            .as_deref()
+            .and_then(|bytes| safe_utf8_prefix(bytes, MAX_TEXT_INDEX_BYTES))
+            .unwrap_or_default();
         if self.fts_enabled {
-            let text = payload
-                .bytes
-                .as_deref()
-                .and_then(|bytes| safe_utf8_prefix(bytes, MAX_TEXT_INDEX_BYTES))
-                .unwrap_or_default();
             transaction.execute(
                 "INSERT INTO websocket_fts(event_id, connection_id, payload) VALUES (?1, ?2, ?3)",
                 params![event_id, internal_connection_id, text],
+            )?;
+        } else {
+            transaction.execute(
+                "INSERT INTO websocket_search_fallback(event_id, url, payload) VALUES (?1, ?2, ?3)",
+                params![
+                    event_id,
+                    connection_url.as_deref().unwrap_or_default(),
+                    text
+                ],
             )?;
         }
         if let Some(url) = connection_url.as_deref().map(Url::parse).transpose()? {
@@ -1805,6 +1940,129 @@ impl Store {
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA query_only=ON;")?;
         Ok(connection)
+    }
+}
+
+fn backfill_fallback_search(connection: &mut Connection, blobs: &BlobStore) -> anyhow::Result<()> {
+    type TrafficRow = (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let traffic = {
+        let mut statement = connection.prepare(
+            "SELECT o.id, req.url, req.headers_json, res.headers_json,
+                    req.body_hash, req_blob.codec, res.body_hash, res_blob.codec
+             FROM observations o
+             JOIN request_variants req ON req.id = o.request_id
+             LEFT JOIN response_variants res ON res.id = o.response_id
+             LEFT JOIN blobs req_blob ON req_blob.hash = req.body_hash
+             LEFT JOIN blobs res_blob ON res_blob.hash = res.body_hash
+             LEFT JOIN traffic_search_fallback fallback ON fallback.observation_id = o.id
+             WHERE fallback.observation_id IS NULL",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            })?
+            .collect::<Result<Vec<TrafficRow>, _>>()?
+    };
+    let websockets = {
+        let mut statement = connection.prepare(
+            "SELECT we.id, wc.url, we.payload_hash, payload_blob.codec
+             FROM websocket_events we
+             JOIN websocket_connections wc ON wc.id = we.connection_id
+             LEFT JOIN blobs payload_blob ON payload_blob.hash = we.payload_hash
+             LEFT JOIN websocket_search_fallback fallback ON fallback.event_id = we.id
+             WHERE fallback.event_id IS NULL",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    let transaction = connection.transaction()?;
+    for (
+        id,
+        url,
+        request_headers,
+        response_headers,
+        request_hash,
+        request_codec,
+        response_hash,
+        response_codec,
+    ) in traffic
+    {
+        let body_preview = [
+            fallback_blob_text(blobs, request_hash.as_deref(), request_codec.as_deref())?,
+            fallback_blob_text(blobs, response_hash.as_deref(), response_codec.as_deref())?,
+        ]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+        transaction.execute(
+            "INSERT INTO traffic_search_fallback(observation_id, url, headers, body_preview)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                id,
+                url,
+                format!(
+                    "{}\n{}",
+                    request_headers,
+                    response_headers.unwrap_or_default()
+                ),
+                body_preview
+            ],
+        )?;
+    }
+    for (id, url, payload_hash, payload_codec) in websockets {
+        let payload = fallback_blob_text(blobs, payload_hash.as_deref(), payload_codec.as_deref())?;
+        transaction.execute(
+            "INSERT INTO websocket_search_fallback(event_id, url, payload) VALUES (?1, ?2, ?3)",
+            params![id, url.unwrap_or_default(), payload],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn fallback_blob_text(
+    blobs: &BlobStore,
+    hash: Option<&str>,
+    codec: Option<&str>,
+) -> anyhow::Result<String> {
+    let (Some(hash), Some(codec)) = (hash, codec) else {
+        return Ok(String::new());
+    };
+    let bytes = blobs.read(hash, codec, MAX_TEXT_INDEX_BYTES)?;
+    match std::str::from_utf8(&bytes) {
+        Ok(text) => Ok(text.to_owned()),
+        Err(error) if error.error_len().is_none() && error.valid_up_to() > 0 => {
+            Ok(std::str::from_utf8(&bytes[..error.valid_up_to()])?.to_owned())
+        }
+        Err(_) => Ok(String::new()),
     }
 }
 
@@ -2433,12 +2691,236 @@ mod tests {
     }
 
     #[test]
+    fn traffic_host_filter_is_escaped_case_insensitive_substring() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let session = store
+            .create_session(CreateSession {
+                label: "host filter".into(),
+                source: "extension".into(),
+                scope_profile_id: None,
+            })
+            .unwrap();
+        store
+            .ingest_http(HttpIngestBatch {
+                producer_id: "host-filter".into(),
+                session_id: session.id,
+                events: vec![
+                    event(1, "https://api.example.com/items", "2026-11-20T12:00:00Z"),
+                    event(2, "https://other.test/items", "2026-11-20T12:01:00Z"),
+                ],
+            })
+            .unwrap();
+
+        let matching = store
+            .traffic(TrafficQuery {
+                host: Some("EXAMPLE".into()),
+                ..TrafficQuery::default()
+            })
+            .unwrap();
+        assert_eq!(matching.items.len(), 1);
+        assert_eq!(matching.items[0].host, "api.example.com");
+        assert!(
+            store
+                .traffic(TrafficQuery {
+                    host: Some("%".into()),
+                    ..TrafficQuery::default()
+                })
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        assert!(
+            store
+                .traffic(TrafficQuery {
+                    host: Some("_".into()),
+                    ..TrafficQuery::default()
+                })
+                .unwrap()
+                .items
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn traffic_fallback_search_covers_headers_and_bodies() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+        let session = store
+            .create_session(CreateSession {
+                label: "fallback search".into(),
+                source: "extension".into(),
+                scope_profile_id: None,
+            })
+            .unwrap();
+        let mut capture = event(1, "https://example.com/search", "2026-11-20T12:00:00Z");
+        let request_body = "request-body-marker";
+        let response_body = "response-body-marker";
+        capture.request.headers = vec![HeaderField {
+            name: "x-request-marker".into(),
+            value: "request-header-value".into(),
+        }];
+        capture.request.body = Some(CapturedBody {
+            encoding: BodyEncoding::Utf8,
+            data: request_body.into(),
+            state: BodyState::Complete,
+            reason: None,
+            original_size: Some(request_body.len() as u64),
+        });
+        capture.response = Some(CapturedResponse {
+            status: 200,
+            headers: vec![HeaderField {
+                name: "x-response-marker".into(),
+                value: "response-header-value".into(),
+            }],
+            body: Some(CapturedBody {
+                encoding: BodyEncoding::Utf8,
+                data: response_body.into(),
+                state: BodyState::Complete,
+                reason: None,
+                original_size: Some(response_body.len() as u64),
+            }),
+        });
+        store
+            .ingest_http(HttpIngestBatch {
+                producer_id: "fallback-producer".into(),
+                session_id: session.id,
+                events: vec![capture],
+            })
+            .unwrap();
+
+        {
+            let mut connection = store.writer().unwrap();
+            backfill_fallback_search(&mut connection, &store.blobs).unwrap();
+        }
+        store.fts_enabled = false;
+
+        for term in [
+            "request-header-value",
+            "response-header-value",
+            "request-body-marker",
+            "response-body-marker",
+        ] {
+            assert_eq!(
+                store
+                    .traffic(TrafficQuery {
+                        text: Some(term.into()),
+                        ..TrafficQuery::default()
+                    })
+                    .unwrap()
+                    .items
+                    .len(),
+                1,
+                "fallback search missed {term}"
+            );
+        }
+    }
+
+    #[test]
     fn cursor_is_stable_and_round_trips() {
         let cursor = make_cursor("2026-11-20T10:00:00Z", "id");
         assert_eq!(
             parse_cursor(&cursor).unwrap(),
             ("2026-11-20T10:00:00Z".into(), "id".into())
         );
+    }
+
+    #[test]
+    fn active_browser_source_is_reserved_across_concurrent_writers() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_store = std::sync::Arc::new(Store::open(temp.path()).unwrap());
+        let second_store = std::sync::Arc::new(Store::open(temp.path()).unwrap());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+
+        let create = |store: std::sync::Arc<Store>, barrier: std::sync::Arc<std::sync::Barrier>| {
+            std::thread::spawn(move || {
+                barrier.wait();
+                store.create_session(CreateSession {
+                    label: "browser".into(),
+                    source: "browser:profile-a".into(),
+                    scope_profile_id: None,
+                })
+            })
+        };
+        let first = create(first_store.clone(), barrier.clone());
+        let second = create(second_store.clone(), barrier.clone());
+        barrier.wait();
+        let first = first.join().unwrap();
+        let second = second.join().unwrap();
+        let (active, rejected) = match (first, second) {
+            (Ok(active), Err(rejected)) | (Err(rejected), Ok(active)) => (active, rejected),
+            (first, second) => {
+                panic!("expected one success and one rejection: {first:?}, {second:?}")
+            }
+        };
+        assert!(is_input_error(&rejected));
+        assert!(rejected.to_string().contains("already exists"));
+
+        first_store.end_session(&active.id).unwrap();
+        let reused_after_end = second_store
+            .create_session(CreateSession {
+                label: "browser after end".into(),
+                source: "browser:profile-a".into(),
+                scope_profile_id: None,
+            })
+            .unwrap();
+        second_store.end_session(&reused_after_end.id).unwrap();
+        second_store
+            .delete_session(&reused_after_end.id)
+            .unwrap()
+            .unwrap();
+        let reused_after_delete = first_store
+            .create_session(CreateSession {
+                label: "browser after delete".into(),
+                source: "browser:profile-a".into(),
+                scope_profile_id: None,
+            })
+            .unwrap();
+        first_store.end_session(&reused_after_delete.id).unwrap();
+    }
+
+    #[test]
+    fn capture_gap_retries_are_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let session = store
+            .create_session(CreateSession {
+                label: "gaps".into(),
+                source: "extension".into(),
+                scope_profile_id: None,
+            })
+            .unwrap();
+        let input = CaptureGapInput {
+            session_id: session.id.clone(),
+            source: "extension".into(),
+            dropped_events: 3,
+            reason: "debugger detached".into(),
+            observed_at: Some("2026-11-20T12:00:00Z".into()),
+            producer_id: Some("browser-1".into()),
+            sequence: Some(7),
+        };
+
+        let first = store.record_gap(input.clone()).unwrap();
+        let retry = store.record_gap(input.clone()).unwrap();
+        assert_eq!(retry, first);
+        assert_eq!(
+            store
+                .capture_gaps(CaptureGapQuery {
+                    session_id: Some(session.id),
+                    limit: None,
+                })
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let conflict = store
+            .record_gap(CaptureGapInput {
+                reason: "different content".into(),
+                ..input
+            })
+            .unwrap_err();
+        assert!(conflict.to_string().contains("different content"));
     }
 
     #[test]
@@ -2731,9 +3213,31 @@ mod tests {
             })
             .unwrap();
 
+        let second_body = r#"{"user":{"email":42}}"#;
+        let mut second = event(2, "https://example.com/users", "2026-11-20T12:01:00Z");
+        second.request.method = "POST".into();
+        second.request.headers = vec![HeaderField {
+            name: "content-type".into(),
+            value: "application/json".into(),
+        }];
+        second.request.body = Some(CapturedBody {
+            encoding: BodyEncoding::Utf8,
+            data: second_body.into(),
+            state: BodyState::Complete,
+            reason: None,
+            original_size: Some(second_body.len() as u64),
+        });
+        store
+            .ingest_http(HttpIngestBatch {
+                producer_id: "json-producer".into(),
+                session_id: session.id.clone(),
+                events: vec![second],
+            })
+            .unwrap();
+
         let parameters = store
             .graph(GraphQuery {
-                session_id: Some(session.id),
+                session_id: Some(session.id.clone()),
                 kind: Some("parameter".into()),
                 text: Some("user.email".into()),
                 ..GraphQuery::default()
@@ -2742,12 +3246,34 @@ mod tests {
         assert_eq!(parameters.nodes.len(), 1);
         assert_eq!(parameters.nodes[0].label, "user.email");
         assert_eq!(parameters.nodes[0].metadata["location"], "body");
+        assert_eq!(parameters.nodes[0].metadata["valueType"], "number");
+        assert_eq!(
+            parameters.nodes[0].metadata["observedTypes"],
+            serde_json::json!(["string", "number"])
+        );
         assert!(
             !parameters.nodes[0]
                 .metadata
                 .to_string()
                 .contains("secret@example.com")
         );
+        let metadata_only = store
+            .graph(GraphQuery {
+                session_id: Some(session.id),
+                kind: Some("parameter".into()),
+                text: Some("VALUETYPE".into()),
+                ..GraphQuery::default()
+            })
+            .unwrap();
+        assert!(!metadata_only.nodes.is_empty());
+        assert!(metadata_only.nodes.iter().all(|node| {
+            node.metadata.get("valueType").is_some()
+                && !node.label.to_ascii_lowercase().contains("valuetype")
+                && !node
+                    .canonical_key
+                    .to_ascii_lowercase()
+                    .contains("valuetype")
+        }));
     }
 
     #[test]
@@ -2789,7 +3315,8 @@ mod tests {
     #[test]
     fn websocket_history_handles_out_of_order_events_and_text_search() {
         let temp = tempfile::tempdir().unwrap();
-        let store = Store::open(temp.path()).unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+        store.fts_enabled = false;
         let session = store
             .create_session(CreateSession {
                 label: "websocket".into(),

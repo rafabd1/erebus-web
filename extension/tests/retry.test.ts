@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { QueueItem } from "../src/protocol";
-import { classifyAcknowledgements, retryDelay } from "../src/retry";
+import { classifyAcknowledgements, classifyDeliveryFailure, retryDelay } from "../src/retry";
 
 const item = (sequence: number): QueueItem => ({
   id: `producer:${sequence}`,
@@ -33,5 +33,26 @@ describe("retryDelay", () => {
   it("backs off and caps the delay", () => {
     expect(retryDelay(0, 0)).toBe(375);
     expect(retryDelay(20, 1)).toBe(75_000);
+  });
+});
+
+describe("classifyDeliveryFailure", () => {
+  it("stops a revoked or missing target without retrying forever", () => {
+    expect(classifyDeliveryFailure(410, "pairing session ended", 0)).toBe("reject-target");
+    expect(classifyDeliveryFailure(404, "not found", 0)).toBe("reject-target");
+    expect(classifyDeliveryFailure(400, "capture session does not exist", 0)).toBe("reject-target");
+  });
+
+  it("gives runtime rebinds a bounded window for authorization failures", () => {
+    expect(classifyDeliveryFailure(401, "unauthorized", 0)).toBe("retry");
+    expect(classifyDeliveryFailure(403, "forbidden", 1)).toBe("retry");
+    expect(classifyDeliveryFailure(401, "unauthorized", 2)).toBe("reject-target");
+  });
+
+  it("rejects malformed or conflicting batches and retries transient failures", () => {
+    expect(classifyDeliveryFailure(400, "invalid batch", 0)).toBe("reject-batch");
+    expect(classifyDeliveryFailure(409, "sequence conflict", 0)).toBe("reject-batch");
+    expect(classifyDeliveryFailure(429, "busy", 0)).toBe("retry");
+    expect(classifyDeliveryFailure(503, "unavailable", 0)).toBe("retry");
   });
 });

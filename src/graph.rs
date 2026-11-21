@@ -1,4 +1,4 @@
-use rusqlite::{Transaction, params};
+use rusqlite::{OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 use url::Url;
 use uuid::Uuid;
@@ -175,6 +175,7 @@ pub fn project_http(
                 "name": parameter.name,
                 "path": parameter.path,
                 "valueType": parameter.value_type,
+                "observedTypes": [parameter.value_type],
             }),
             captured_at,
         )?;
@@ -301,6 +302,19 @@ fn upsert_node(
     seen_at: &str,
 ) -> anyhow::Result<String> {
     let id = Uuid::now_v7().to_string();
+    let metadata = transaction
+        .query_row(
+            "SELECT metadata_json FROM graph_nodes WHERE canonical_key = ?1",
+            [canonical_key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|existing| {
+            serde_json::from_str(&existing)
+                .map(|existing| merge_metadata(existing, metadata.clone()))
+        })
+        .transpose()?
+        .unwrap_or(metadata);
     let metadata = serde_json::to_string(&metadata)?;
     transaction.execute(
         "INSERT INTO graph_nodes(id, kind, canonical_key, label, metadata_json, first_seen, last_seen, evidence_count)
@@ -312,6 +326,7 @@ fn upsert_node(
              last_seen = CASE
                  WHEN julianday(excluded.last_seen) > julianday(graph_nodes.last_seen)
                  THEN excluded.last_seen ELSE graph_nodes.last_seen END,
+             metadata_json = excluded.metadata_json,
              evidence_count = graph_nodes.evidence_count + 1",
         params![id, kind, canonical_key, label, metadata, seen_at],
     )?;
@@ -322,6 +337,29 @@ fn upsert_node(
             |row| row.get(0),
         )
         .map_err(Into::into)
+}
+
+fn merge_metadata(existing: Value, incoming: Value) -> Value {
+    match (existing, incoming) {
+        (Value::Object(mut existing), Value::Object(incoming)) => {
+            for (key, value) in incoming {
+                let merged = existing
+                    .remove(&key)
+                    .map_or(value.clone(), |current| merge_metadata(current, value));
+                existing.insert(key, merged);
+            }
+            Value::Object(existing)
+        }
+        (Value::Array(mut existing), Value::Array(incoming)) => {
+            for value in incoming {
+                if !existing.contains(&value) {
+                    existing.push(value);
+                }
+            }
+            Value::Array(existing)
+        }
+        (_, incoming) => incoming,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

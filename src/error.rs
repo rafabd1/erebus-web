@@ -11,6 +11,8 @@ pub enum AppError {
     NotFound,
     #[error("unauthorized")]
     Unauthorized,
+    #[error("pairing session ended")]
+    Gone,
     #[error("forbidden")]
     Forbidden,
     #[error("{0}")]
@@ -33,6 +35,7 @@ impl IntoResponse for AppError {
         let status = match &self {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::Gone => StatusCode::GONE,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::InvalidInput(_) => StatusCode::BAD_REQUEST,
             Self::Busy => StatusCode::TOO_MANY_REQUESTS,

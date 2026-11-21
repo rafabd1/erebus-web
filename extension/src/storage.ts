@@ -132,6 +132,25 @@ export async function clearQueue(): Promise<QueueItem[]> {
   return items;
 }
 
+export async function deadLetterTarget(target: QueueItem["target"], error: string): Promise<QueueItem[]> {
+  const db = await database();
+  const transaction = db.transaction([QUEUE_STORE, DEAD_STORE], "readwrite");
+  const queue = transaction.objectStore(QUEUE_STORE);
+  const dead = transaction.objectStore(DEAD_STORE);
+  const queued = (await requestResult(queue.getAll())) as QueueItem[];
+  const rejected = queued.filter(
+    (item) =>
+      item.target.sessionId === target.sessionId && item.target.producerId === target.producerId
+  );
+  const failedAt = Date.now();
+  for (const item of rejected) {
+    queue.delete(item.id);
+    dead.put({ ...item, failedAt, error } satisfies DeadLetter);
+  }
+  await transactionDone(transaction);
+  return rejected;
+}
+
 export async function acknowledge(
   remove: QueueItem[],
   reject: Array<{ item: QueueItem; error: string }>,

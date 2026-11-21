@@ -69,27 +69,21 @@ impl ScopeProfile {
     }
 
     pub fn evaluate(&self, url: &Url) -> ScopeDecision {
-        let mut first_include = None;
         for rule in &self.rules {
             if !rule.matches(url) {
                 continue;
             }
-            if rule.action == ScopeAction::Exclude {
-                return ScopeDecision {
+            return match rule.action {
+                ScopeAction::Include => ScopeDecision {
+                    state: ScopeState::InScope,
+                    rule_id: Some(rule.id.clone()),
+                    reason: "matched include rule".into(),
+                },
+                ScopeAction::Exclude => ScopeDecision {
                     state: ScopeState::OutOfScope,
                     rule_id: Some(rule.id.clone()),
                     reason: "matched exclude rule".into(),
-                };
-            }
-            if first_include.is_none() {
-                first_include = Some(rule.id.clone());
-            }
-        }
-        if let Some(rule_id) = first_include {
-            return ScopeDecision {
-                state: ScopeState::InScope,
-                rule_id: Some(rule_id),
-                reason: "matched include rule".into(),
+                },
             };
         }
         if self.has_includes {
@@ -137,8 +131,8 @@ mod tests {
     }
 
     #[test]
-    fn excludes_win_over_includes() {
-        let profile = ScopeProfile::compile([
+    fn first_matching_rule_wins() {
+        let include_first = ScopeProfile::compile([
             (
                 "include".into(),
                 rule(
@@ -157,18 +151,32 @@ mod tests {
             ),
         ])
         .unwrap();
-        assert_eq!(
-            profile
-                .evaluate(&Url::parse("https://api.example.com/a").unwrap())
-                .state,
-            ScopeState::InScope
-        );
-        assert_eq!(
-            profile
-                .evaluate(&Url::parse("https://admin.example.com/a").unwrap())
-                .state,
-            ScopeState::OutOfScope
-        );
+        let decision = include_first.evaluate(&Url::parse("https://admin.example.com/a").unwrap());
+        assert_eq!(decision.state, ScopeState::InScope);
+        assert_eq!(decision.rule_id.as_deref(), Some("include"));
+
+        let exclude_first = ScopeProfile::compile([
+            (
+                "exclude".into(),
+                rule(
+                    ScopeAction::Exclude,
+                    ScopeMatcher::Host,
+                    "admin.example.com",
+                ),
+            ),
+            (
+                "include".into(),
+                rule(
+                    ScopeAction::Include,
+                    ScopeMatcher::HostWildcard,
+                    "*.example.com",
+                ),
+            ),
+        ])
+        .unwrap();
+        let decision = exclude_first.evaluate(&Url::parse("https://admin.example.com/a").unwrap());
+        assert_eq!(decision.state, ScopeState::OutOfScope);
+        assert_eq!(decision.rule_id.as_deref(), Some("exclude"));
     }
 
     #[test]

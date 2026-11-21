@@ -17,6 +17,7 @@ use crate::store::Store;
 const INGEST_BATCH_ITEMS: usize = 100;
 const INGEST_INTERVAL: Duration = Duration::from_millis(50);
 const SHUTDOWN_DRAIN_LIMIT: Duration = Duration::from_secs(5);
+const SHUTDOWN_JOIN_LIMIT: Duration = Duration::from_secs(12);
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -104,7 +105,7 @@ impl CaptureManager {
         } = managed;
         let dropped_events = handle.dropped_events();
         let shutdown_result = handle.shutdown().await;
-        let drain_result = match tokio::time::timeout(SHUTDOWN_DRAIN_LIMIT, &mut worker).await {
+        let drain_result = match tokio::time::timeout(SHUTDOWN_JOIN_LIMIT, &mut worker).await {
             Ok(result) => result.map_err(anyhow::Error::from),
             Err(_) => {
                 worker.abort();
@@ -184,6 +185,8 @@ async fn ingest_proxy_events(
                             dropped_events: gap.dropped_events,
                             reason: gap.reason.into(),
                             observed_at: None,
+                            producer_id: None,
+                            sequence: None,
                         };
                         let store = store.clone();
                         match tokio::task::spawn_blocking(move || store.record_gap(input)).await {
@@ -219,13 +222,25 @@ async fn ingest_proxy_events(
         }
     }
     if !http.is_empty() || !websocket.is_empty() {
+        let remaining = (http.len() + websocket.len()) as u64;
         tracing::error!(
             %session_id,
             http_events = http.len(),
             websocket_events = websocket.len(),
             "capture events remained after the shutdown drain limit"
         );
+        persist_shutdown_drain_gap(store, session_id, remaining).await;
     }
+}
+
+async fn persist_shutdown_drain_gap(store: Arc<Store>, session_id: String, remaining: u64) {
+    persist_gap(
+        store,
+        session_id,
+        remaining,
+        "capture events remained after the shutdown drain limit".into(),
+    )
+    .await;
 }
 
 async fn flush_pending(
@@ -289,6 +304,8 @@ async fn persist_gap(store: Arc<Store>, session_id: String, dropped_events: u64,
         dropped_events,
         reason,
         observed_at: None,
+        producer_id: None,
+        sequence: None,
     };
     match tokio::task::spawn_blocking(move || store.record_gap(input)).await {
         Ok(Ok(_)) => {}
@@ -315,7 +332,7 @@ fn report_rejections(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CreateSession, TrafficQuery};
+    use crate::model::{CaptureGapQuery, CreateSession, TrafficQuery};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     #[tokio::test]
@@ -376,5 +393,34 @@ mod tests {
         .await
         .unwrap();
         manager.stop(&session.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_drain_loss_is_persisted_as_a_gap() {
+        assert!(SHUTDOWN_JOIN_LIMIT > SHUTDOWN_DRAIN_LIMIT);
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(temp.path()).unwrap());
+        let session = store
+            .create_session(CreateSession {
+                label: "drain".into(),
+                source: "proxy".into(),
+                scope_profile_id: None,
+            })
+            .unwrap();
+
+        persist_shutdown_drain_gap(store.clone(), session.id.clone(), 5).await;
+
+        let gaps = store
+            .capture_gaps(CaptureGapQuery {
+                session_id: Some(session.id),
+                limit: None,
+            })
+            .unwrap();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].dropped_events, 5);
+        assert_eq!(
+            gaps[0].reason,
+            "capture events remained after the shutdown drain limit"
+        );
     }
 }

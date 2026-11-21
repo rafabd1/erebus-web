@@ -16,7 +16,7 @@ It captures HTTP, HTTPS, HTTP/2, and WebSocket traffic from isolated browser ses
 - Notes attached to captured requests and graph evidence
 - Gap records when a capture source drops events
 
-The service binds to loopback. Erebus starts it with a fresh process token; extension pairing issues a short-lived token tied to one active capture session.
+The service binds to loopback. Erebus starts it with a fresh process token; extension pairing issues a session-bound token for one active capture session.
 
 ## Development
 

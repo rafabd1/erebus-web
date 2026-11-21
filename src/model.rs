@@ -500,6 +500,8 @@ pub struct CaptureGapInput {
     pub dropped_events: u64,
     pub reason: String,
     pub observed_at: Option<String>,
+    pub producer_id: Option<String>,
+    pub sequence: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Default)]
@@ -509,7 +511,7 @@ pub struct CaptureGapQuery {
     pub limit: Option<u32>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CaptureGap {
     pub id: String,

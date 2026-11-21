@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use axum::Json;
@@ -22,6 +22,7 @@ use crate::store::Store;
 
 const MAX_API_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BLOCKING_TASKS: usize = 8;
+const MAX_REVOKED_PAIRINGS: usize = 1_024;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -76,7 +77,19 @@ impl AppState {
 
 #[derive(Clone, Default)]
 struct PairingTokens {
-    by_token: Arc<Mutex<HashMap<String, String>>>,
+    state: Arc<Mutex<PairingTokenState>>,
+}
+
+#[derive(Default)]
+struct PairingTokenState {
+    active: HashMap<String, String>,
+    revoked: VecDeque<String>,
+}
+
+enum PairingResolution {
+    Active(String),
+    Revoked,
+    Unknown,
 }
 
 impl PairingTokens {
@@ -84,21 +97,44 @@ impl PairingTokens {
         let mut random = [0_u8; 32];
         rand::rng().fill_bytes(&mut random);
         let token = blake3::hash(&random).to_hex().to_string();
-        let mut by_token = self.by_token.lock().await;
-        by_token.retain(|_, paired_session| paired_session != session_id);
-        by_token.insert(token.clone(), session_id.to_owned());
+        let mut state = self.state.lock().await;
+        state
+            .active
+            .retain(|_, paired_session| paired_session != session_id);
+        state.revoked.retain(|revoked| revoked != &token);
+        state.active.insert(token.clone(), session_id.to_owned());
         token
     }
 
-    async fn resolve(&self, token: &str) -> Option<String> {
-        self.by_token.lock().await.get(token).cloned()
+    async fn resolve(&self, token: &str) -> PairingResolution {
+        let state = self.state.lock().await;
+        if let Some(session_id) = state.active.get(token) {
+            PairingResolution::Active(session_id.clone())
+        } else if state.revoked.iter().any(|revoked| revoked == token) {
+            PairingResolution::Revoked
+        } else {
+            PairingResolution::Unknown
+        }
     }
 
     async fn revoke_session(&self, session_id: &str) {
-        self.by_token
-            .lock()
-            .await
+        let mut state = self.state.lock().await;
+        let revoked = state
+            .active
+            .iter()
+            .filter_map(|(token, paired_session)| {
+                (paired_session == session_id).then_some(token.clone())
+            })
+            .collect::<Vec<_>>();
+        state
+            .active
             .retain(|_, paired_session| paired_session != session_id);
+        for token in revoked {
+            state.revoked.push_back(token);
+        }
+        while state.revoked.len() > MAX_REVOKED_PAIRINGS {
+            state.revoked.pop_front();
+        }
     }
 }
 
@@ -176,12 +212,11 @@ async fn authorize(
     let authorization = if constant_time_eq(token.as_bytes(), state.config.token().as_bytes()) {
         RuntimeAuthorization::Master
     } else if pairing_capture_path(request.method(), request.uri().path()) {
-        state
-            .pairings
-            .resolve(token)
-            .await
-            .map(RuntimeAuthorization::Pairing)
-            .ok_or(AppError::Unauthorized)?
+        match state.pairings.resolve(token).await {
+            PairingResolution::Active(session_id) => RuntimeAuthorization::Pairing(session_id),
+            PairingResolution::Revoked => return Err(AppError::Gone),
+            PairingResolution::Unknown => return Err(AppError::Unauthorized),
+        }
     } else {
         return Err(AppError::Unauthorized);
     };
@@ -718,7 +753,7 @@ mod tests {
     use serde_json::{Value, json};
     use tower::ServiceExt as _;
 
-    use super::{AppState, constant_time_eq, router};
+    use super::{AppState, PairingResolution, PairingTokens, constant_time_eq, router};
     use crate::config::Config;
     use crate::model::CreateSession;
     use crate::store::Store;
@@ -728,6 +763,27 @@ mod tests {
         assert!(constant_time_eq(b"same", b"same"));
         assert!(!constant_time_eq(b"same", b"diff"));
         assert!(!constant_time_eq(b"same", b"short"));
+    }
+
+    #[tokio::test]
+    async fn pairing_replacement_stays_rebindable_and_revocation_is_terminal() {
+        let pairings = PairingTokens::default();
+        let first = pairings.issue("session").await;
+        let second = pairings.issue("session").await;
+        assert!(matches!(
+            pairings.resolve(&first).await,
+            PairingResolution::Unknown
+        ));
+        assert!(matches!(
+            pairings.resolve(&second).await,
+            PairingResolution::Active(session) if session == "session"
+        ));
+
+        pairings.revoke_session("session").await;
+        assert!(matches!(
+            pairings.resolve(&second).await,
+            PairingResolution::Revoked
+        ));
     }
 
     async fn call(
@@ -854,6 +910,27 @@ mod tests {
         .await;
         assert_eq!(accepted.status(), StatusCode::OK);
 
+        let gap = json!({
+            "sessionId": first.id,
+            "source": "extension",
+            "droppedEvents": 2,
+            "reason": "debugger detached",
+            "observedAt": "2026-11-20T12:00:00Z",
+            "producerId": "extension-test",
+            "sequence": 2,
+        });
+        let first_gap = call(&app, "POST", "/v1/gaps", pairing, Some(gap.clone())).await;
+        assert_eq!(first_gap.status(), StatusCode::OK);
+        let first_gap: serde_json::Value =
+            serde_json::from_slice(&to_bytes(first_gap.into_body(), 16 * 1024).await.unwrap())
+                .unwrap();
+        let retry_gap = call(&app, "POST", "/v1/gaps", pairing, Some(gap)).await;
+        assert_eq!(retry_gap.status(), StatusCode::OK);
+        let retry_gap: serde_json::Value =
+            serde_json::from_slice(&to_bytes(retry_gap.into_body(), 16 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(retry_gap["id"], first_gap["id"]);
+
         let ended = call(
             &app,
             "POST",
@@ -876,7 +953,22 @@ mod tests {
             })),
         )
         .await;
-        assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(revoked.status(), StatusCode::GONE);
+
+        let unknown = call(
+            &app,
+            "POST",
+            "/v1/gaps",
+            "never-issued",
+            Some(json!({
+                "sessionId": first.id,
+                "source": "extension",
+                "droppedEvents": 1,
+                "reason": "unknown token",
+            })),
+        )
+        .await;
+        assert_eq!(unknown.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

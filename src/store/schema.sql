@@ -34,6 +34,17 @@ CREATE TABLE IF NOT EXISTS capture_sessions (
     ended_at TEXT,
     scope_profile_id TEXT NOT NULL REFERENCES scope_profiles(id)
 );
+CREATE TRIGGER IF NOT EXISTS reserve_active_browser_source
+BEFORE INSERT ON capture_sessions
+WHEN NEW.ended_at IS NULL
+  AND NEW.source GLOB 'browser:*'
+  AND EXISTS (
+      SELECT 1 FROM capture_sessions
+      WHERE source = NEW.source AND ended_at IS NULL
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'active browser source already reserved');
+END;
 
 CREATE TABLE IF NOT EXISTS blobs (
     hash TEXT PRIMARY KEY,
@@ -109,6 +120,13 @@ CREATE INDEX IF NOT EXISTS idx_observations_scope ON observations(scope_state);
 CREATE INDEX IF NOT EXISTS idx_request_host_path ON request_variants(host, path, method);
 CREATE INDEX IF NOT EXISTS idx_response_status ON response_variants(status);
 
+CREATE TABLE IF NOT EXISTS traffic_search_fallback (
+    observation_id TEXT PRIMARY KEY REFERENCES observations(id) ON DELETE CASCADE,
+    url TEXT NOT NULL,
+    headers TEXT NOT NULL,
+    body_preview TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS websocket_connections (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES capture_sessions(id) ON DELETE CASCADE,
@@ -148,6 +166,12 @@ CREATE TABLE IF NOT EXISTS websocket_events (
 
 CREATE INDEX IF NOT EXISTS idx_websocket_events_connection
 ON websocket_events(connection_id, captured_at, sequence);
+
+CREATE TABLE IF NOT EXISTS websocket_search_fallback (
+    event_id TEXT PRIMARY KEY REFERENCES websocket_events(id) ON DELETE CASCADE,
+    url TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS capture_gaps (
     id TEXT PRIMARY KEY,

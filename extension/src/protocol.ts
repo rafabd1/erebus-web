@@ -54,7 +54,17 @@ export interface WebSocketFrameEvent {
   error?: string;
 }
 
-export type QueueKind = "http" | "ws";
+export interface CaptureGapEvent {
+  sessionId: string;
+  source: "extension";
+  droppedEvents: number;
+  reason: string;
+  observedAt: string;
+  producerId: string;
+  sequence: number;
+}
+
+export type QueueKind = "http" | "ws" | "gap";
 
 export interface QueueTarget {
   serverUrl: string;
@@ -62,7 +72,7 @@ export interface QueueTarget {
   producerId: string;
 }
 
-export interface QueueItem<T = HttpCaptureEvent | WebSocketFrameEvent> {
+export interface QueueItem<T = HttpCaptureEvent | WebSocketFrameEvent | CaptureGapEvent> {
   id: string;
   kind: QueueKind;
   sequence: number;
