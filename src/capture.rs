@@ -1,29 +1,34 @@
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use uuid::Uuid;
 
 use crate::model::{
     CaptureGapInput, HttpCaptureEvent, HttpIngestBatch, WebSocketFrameEvent, WebSocketIngestBatch,
 };
-use crate::proxy::{ProxyCapture, ProxyConfig, ProxyHandle, start_proxy};
+use crate::proxy::{
+    ProxyCapture, ProxyConfig, ProxyHandle, UpstreamTlsConfig, atomic_write, start_proxy,
+};
 use crate::store::Store;
 
 const INGEST_BATCH_ITEMS: usize = 100;
 const INGEST_INTERVAL: Duration = Duration::from_millis(50);
 const SHUTDOWN_DRAIN_LIMIT: Duration = Duration::from_secs(5);
 const SHUTDOWN_JOIN_LIMIT: Duration = Duration::from_secs(12);
+const UPSTREAM_TLS_FILE_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CaptureProxyDescriptor {
     pub url: String,
     pub ca_endpoint: &'static str,
+    pub upstream_tls_mode: String,
 }
 
 #[derive(Clone)]
@@ -39,8 +44,17 @@ struct CaptureManagerInner {
 
 struct ManagedProxy {
     descriptor: CaptureProxyDescriptor,
+    upstream_tls: UpstreamTlsConfig,
     handle: ProxyHandle,
     worker: JoinHandle<()>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedUpstreamTls {
+    version: u32,
+    session_id: String,
+    config: UpstreamTlsConfig,
 }
 
 impl CaptureManager {
@@ -54,19 +68,48 @@ impl CaptureManager {
         }
     }
 
-    pub async fn start(&self, session_id: &str) -> anyhow::Result<CaptureProxyDescriptor> {
+    pub async fn start(
+        &self,
+        session_id: &str,
+        upstream_tls: Option<UpstreamTlsConfig>,
+    ) -> anyhow::Result<CaptureProxyDescriptor> {
+        let upstream_tls = upstream_tls.map(|config| config.normalized()).transpose()?;
         let mut active = self.inner.active.lock().await;
         if let Some(existing) = active.get(session_id) {
+            if upstream_tls
+                .as_ref()
+                .is_some_and(|requested| requested != &existing.upstream_tls)
+            {
+                anyhow::bail!("pause the capture proxy before changing upstream TLS settings");
+            }
             return Ok(existing.descriptor.clone());
         }
-        let runtime = start_proxy(&self.inner.proxy_data_dir, ProxyConfig::default()).await?;
+        let upstream_tls = match upstream_tls {
+            Some(config) => config,
+            None => self.upstream_tls(session_id)?,
+        };
+        let upstream_tls_mode = upstream_tls.mode().to_owned();
+        let runtime = start_proxy(
+            &self.inner.proxy_data_dir,
+            ProxyConfig {
+                upstream_tls: upstream_tls.clone(),
+                ..ProxyConfig::default()
+            },
+        )
+        .await?;
         let expected_ca_path = self.inner.proxy_data_dir.join("proxy-ca.pem");
         if runtime.handle.ca_certificate_path() != expected_ca_path {
+            let _ = runtime.handle.shutdown().await;
             anyhow::bail!("capture proxy returned an unexpected CA path");
+        }
+        if let Err(error) = self.persist_upstream_tls(session_id, &upstream_tls) {
+            let _ = runtime.handle.shutdown().await;
+            return Err(error);
         }
         let descriptor = CaptureProxyDescriptor {
             url: format!("http://{}", runtime.handle.address()),
             ca_endpoint: "/v1/proxy/ca",
+            upstream_tls_mode,
         };
         let producer_id = format!("proxy-{}", Uuid::new_v4());
         let worker = tokio::spawn(ingest_proxy_events(
@@ -79,6 +122,7 @@ impl CaptureManager {
             session_id.to_owned(),
             ManagedProxy {
                 descriptor: descriptor.clone(),
+                upstream_tls,
                 handle: runtime.handle,
                 worker,
             },
@@ -138,9 +182,23 @@ impl CaptureManager {
             .keys()
             .cloned()
             .collect::<Vec<_>>();
+        let mut stops = JoinSet::new();
         for session_id in session_ids {
-            if let Err(error) = self.stop(&session_id).await {
-                tracing::warn!(%session_id, %error, "failed to stop capture proxy cleanly");
+            let manager = self.clone();
+            stops.spawn(async move {
+                let result = manager.stop(&session_id).await;
+                (session_id, result)
+            });
+        }
+        while let Some(result) = stops.join_next().await {
+            match result {
+                Ok((session_id, Err(error))) => {
+                    tracing::warn!(%session_id, %error, "failed to stop capture proxy cleanly");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "capture proxy shutdown task failed");
+                }
+                Ok((_, Ok(()))) => {}
             }
         }
     }
@@ -150,6 +208,64 @@ impl CaptureManager {
         tokio::fs::read_to_string(&path)
             .await
             .map_err(anyhow::Error::from)
+    }
+
+    pub fn upstream_tls(&self, session_id: &str) -> anyhow::Result<UpstreamTlsConfig> {
+        let path = self.upstream_tls_path(session_id);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(UpstreamTlsConfig::Verify);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let persisted: PersistedUpstreamTls = serde_json::from_slice(&bytes)?;
+        if persisted.version != UPSTREAM_TLS_FILE_VERSION {
+            anyhow::bail!("unsupported upstream TLS settings version");
+        }
+        if persisted.session_id != session_id {
+            anyhow::bail!("upstream TLS settings belong to another capture session");
+        }
+        let normalized = persisted.config.normalized()?;
+        normalized.validate()?;
+        if normalized != persisted.config {
+            self.persist_upstream_tls(session_id, &normalized)?;
+        }
+        Ok(normalized)
+    }
+
+    pub fn upstream_tls_mode(&self, session_id: &str) -> anyhow::Result<String> {
+        Ok(self.upstream_tls(session_id)?.mode().to_owned())
+    }
+
+    pub fn forget_upstream_tls(&self, session_id: &str) -> anyhow::Result<()> {
+        match fs::remove_file(self.upstream_tls_path(session_id)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn persist_upstream_tls(
+        &self,
+        session_id: &str,
+        config: &UpstreamTlsConfig,
+    ) -> anyhow::Result<()> {
+        let config = config.normalized()?;
+        let bytes = serde_json::to_vec(&PersistedUpstreamTls {
+            version: UPSTREAM_TLS_FILE_VERSION,
+            session_id: session_id.to_owned(),
+            config,
+        })?;
+        atomic_write(&self.upstream_tls_path(session_id), &bytes, true)
+    }
+
+    fn upstream_tls_path(&self, session_id: &str) -> PathBuf {
+        let digest = blake3::hash(session_id.as_bytes()).to_hex().to_string();
+        self.inner
+            .proxy_data_dir
+            .join("upstream-tls")
+            .join(format!("{digest}.json"))
     }
 }
 
@@ -347,7 +463,10 @@ mod tests {
             })
             .unwrap();
         let manager = CaptureManager::new(store.clone(), temp.path());
-        let proxy = manager.start(&session.id).await.unwrap();
+        let proxy = manager
+            .start(&session.id, Some(UpstreamTlsConfig::Verify))
+            .await
+            .unwrap();
         let proxy_address = proxy.url.strip_prefix("http://").unwrap();
 
         let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -396,6 +515,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn custom_upstream_ca_survives_pause_and_manager_restart() {
+        let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_certificate = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = rcgen::Issuer::new(ca_params, ca_key);
+        let server_key = rcgen::KeyPair::generate().unwrap();
+        let mut server_params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        server_params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        server_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let server_certificate = server_params.signed_by(&server_key, &issuer).unwrap();
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![server_certificate.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(server_key.serialize_der()),
+                ),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_address = origin.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = origin.accept().await.unwrap();
+                let mut stream = acceptor.accept(stream).await.unwrap();
+                let mut request = [0_u8; 2_048];
+                let read = stream.read(&mut request).await.unwrap();
+                assert!(String::from_utf8_lossy(&request[..read]).contains("GET /persisted"));
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(temp.path()).unwrap());
+        let session = store
+            .create_session(CreateSession {
+                label: "custom CA".into(),
+                source: "proxy".into(),
+                scope_profile_id: None,
+            })
+            .unwrap();
+        let target = format!("https://localhost:{}/persisted", origin_address.port());
+        let manager = CaptureManager::new(store.clone(), temp.path());
+        let first = manager
+            .start(
+                &session.id,
+                Some(UpstreamTlsConfig::CustomCa {
+                    ca_pem: ca_certificate.pem(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.upstream_tls_mode, "customCa");
+        assert_https_through_proxy(
+            &first.url,
+            &manager.ca_certificate().await.unwrap(),
+            &target,
+        )
+        .await;
+        manager.stop(&session.id).await.unwrap();
+
+        let restarted = CaptureManager::new(store, temp.path());
+        let second = restarted.start(&session.id, None).await.unwrap();
+        assert_eq!(second.upstream_tls_mode, "customCa");
+        assert_https_through_proxy(
+            &second.url,
+            &restarted.ca_certificate().await.unwrap(),
+            &target,
+        )
+        .await;
+        restarted.stop(&session.id).await.unwrap();
+        origin_task.await.unwrap();
+    }
+
+    async fn assert_https_through_proxy(proxy_url: &str, capture_ca: &str, target: &str) {
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(proxy_url).unwrap())
+            .add_root_certificate(reqwest::Certificate::from_pem(capture_ca.as_bytes()).unwrap())
+            .build()
+            .unwrap();
+        let response = client.get(target).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "ok");
+    }
+
+    #[tokio::test]
     async fn shutdown_drain_loss_is_persisted_as_a_gap() {
         assert!(SHUTDOWN_JOIN_LIMIT > SHUTDOWN_DRAIN_LIMIT);
         let temp = tempfile::tempdir().unwrap();
@@ -422,5 +638,39 @@ mod tests {
             gaps[0].reason,
             "capture events remained after the shutdown drain limit"
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_all_stops_every_active_proxy() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(temp.path()).unwrap());
+        let first = store
+            .create_session(CreateSession {
+                label: "first".into(),
+                source: "proxy".into(),
+                scope_profile_id: None,
+            })
+            .unwrap();
+        let second = store
+            .create_session(CreateSession {
+                label: "second".into(),
+                source: "proxy".into(),
+                scope_profile_id: None,
+            })
+            .unwrap();
+        let manager = CaptureManager::new(store, temp.path());
+        manager
+            .start(&first.id, Some(UpstreamTlsConfig::Verify))
+            .await
+            .unwrap();
+        manager
+            .start(&second.id, Some(UpstreamTlsConfig::Verify))
+            .await
+            .unwrap();
+
+        manager.shutdown_all().await;
+
+        assert!(manager.descriptor(&first.id).await.is_none());
+        assert!(manager.descriptor(&second.id).await.is_none());
     }
 }

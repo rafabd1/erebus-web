@@ -1,6 +1,6 @@
 use std::convert::Infallible;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{BufReader, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -11,29 +11,33 @@ use std::time::Instant;
 
 use anyhow::{Context as _, bail};
 use base64::Engine as _;
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use fastwebsockets::{OpCode, Role, WebSocketError, after_handshake_split};
 use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt as _, Full};
+use http_body_util::{BodyExt as _, Empty, Full};
 use http_mitm_proxy::default_client::Upgraded;
 use http_mitm_proxy::hyper::body::{Body, Frame, Incoming, SizeHint};
+use http_mitm_proxy::hyper::client;
 use http_mitm_proxy::hyper::header::{
-    CONNECTION, SEC_WEBSOCKET_EXTENSIONS, SEC_WEBSOCKET_PROTOCOL, UPGRADE,
+    self, CONNECTION, SEC_WEBSOCKET_EXTENSIONS, SEC_WEBSOCKET_PROTOCOL, UPGRADE,
 };
 use http_mitm_proxy::hyper::server;
 use http_mitm_proxy::hyper::service::{HttpService as _, service_fn};
-use http_mitm_proxy::hyper::{Request, Response, StatusCode};
+use http_mitm_proxy::hyper::{Request, Response, StatusCode, Uri, Version};
 use http_mitm_proxy::moka::sync::Cache;
 use http_mitm_proxy::{DefaultClient, MitmProxy, RemoteAddr};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use pin_project_lite::pin_project;
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, DnValue, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
 };
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, RootCertStore, SignatureScheme};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -59,6 +63,7 @@ pub struct ProxyConfig {
     pub event_capacity: usize,
     pub max_body_bytes: usize,
     pub certificate_cache_entries: u64,
+    pub upstream_tls: UpstreamTlsConfig,
 }
 
 impl Default for ProxyConfig {
@@ -68,8 +73,79 @@ impl Default for ProxyConfig {
             event_capacity: DEFAULT_EVENT_CAPACITY,
             max_body_bytes: DEFAULT_BODY_LIMIT,
             certificate_cache_entries: DEFAULT_CERT_CACHE,
+            upstream_tls: UpstreamTlsConfig::Verify,
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "mode")]
+pub enum UpstreamTlsConfig {
+    #[default]
+    #[serde(rename = "verify")]
+    Verify,
+    #[serde(rename = "customCa")]
+    CustomCa {
+        #[serde(rename = "caPem")]
+        ca_pem: String,
+    },
+    #[serde(rename = "insecure")]
+    Insecure,
+}
+
+impl UpstreamTlsConfig {
+    pub fn mode(&self) -> &'static str {
+        match self {
+            Self::Verify => "verify",
+            Self::CustomCa { .. } => "customCa",
+            Self::Insecure => "insecure",
+        }
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        match self {
+            Self::Verify => Ok(()),
+            Self::CustomCa { .. } | Self::Insecure => CustomTlsClient::new(self).map(drop),
+        }
+    }
+
+    pub fn normalized(&self) -> anyhow::Result<Self> {
+        match self {
+            Self::CustomCa { ca_pem } => Ok(Self::CustomCa {
+                ca_pem: normalize_upstream_ca_pem(ca_pem)?,
+            }),
+            Self::Verify | Self::Insecure => Ok(self.clone()),
+        }
+    }
+}
+
+fn parse_upstream_ca_certificates(ca_pem: &str) -> anyhow::Result<Vec<CertificateDer<'static>>> {
+    if ca_pem.trim().is_empty() {
+        bail!("the upstream CA PEM cannot be empty");
+    }
+    let mut reader = BufReader::new(ca_pem.as_bytes());
+    let certificates = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .context("the upstream CA PEM is invalid")?;
+    if certificates.is_empty() {
+        bail!("the upstream CA PEM does not contain a certificate");
+    }
+    Ok(certificates)
+}
+
+fn normalize_upstream_ca_pem(ca_pem: &str) -> anyhow::Result<String> {
+    let certificates = parse_upstream_ca_certificates(ca_pem)?;
+    let mut normalized = String::new();
+    for certificate in certificates {
+        normalized.push_str("-----BEGIN CERTIFICATE-----\n");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(certificate.as_ref());
+        for line in encoded.as_bytes().chunks(64) {
+            normalized.push_str(std::str::from_utf8(line).expect("base64 output is ASCII"));
+            normalized.push('\n');
+        }
+        normalized.push_str("-----END CERTIFICATE-----\n");
+    }
+    Ok(normalized)
 }
 
 #[derive(Clone, Debug)]
@@ -130,6 +206,275 @@ impl Drop for ProxyHandle {
     }
 }
 
+#[derive(Clone)]
+enum UpstreamClient {
+    Default(DefaultClient),
+    Custom(CustomTlsClient),
+}
+
+impl UpstreamClient {
+    fn new(config: &UpstreamTlsConfig) -> anyhow::Result<Self> {
+        match config {
+            UpstreamTlsConfig::Verify => Ok(Self::Default(DefaultClient::new().with_upgrades())),
+            UpstreamTlsConfig::CustomCa { .. } | UpstreamTlsConfig::Insecure => {
+                Ok(Self::Custom(CustomTlsClient::new(config)?))
+            }
+        }
+    }
+
+    async fn send_request<B>(
+        &self,
+        request: Request<B>,
+    ) -> anyhow::Result<(
+        Response<Incoming>,
+        Option<JoinHandle<Result<Upgraded, http_mitm_proxy::hyper::Error>>>,
+    )>
+    where
+        B: Body<Data = Bytes> + Send + Sync + 'static,
+        B::Data: Send + Buf,
+        B::Error: Into<DynError>,
+    {
+        match self {
+            Self::Default(client) => client
+                .send_request(request)
+                .await
+                .map_err(anyhow::Error::from),
+            Self::Custom(client) => client.send_request(request).await,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CustomTlsClient {
+    no_alpn: tokio_rustls::TlsConnector,
+    with_h2: tokio_rustls::TlsConnector,
+}
+
+impl CustomTlsClient {
+    fn new(config: &UpstreamTlsConfig) -> anyhow::Result<Self> {
+        let mut roots = RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        if let UpstreamTlsConfig::CustomCa { ca_pem } = config {
+            for certificate in parse_upstream_ca_certificates(ca_pem)? {
+                roots
+                    .add(certificate)
+                    .context("the upstream CA certificate is invalid")?;
+            }
+        }
+
+        let mut base = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        if matches!(config, UpstreamTlsConfig::Insecure) {
+            base.dangerous()
+                .set_certificate_verifier(Arc::new(AcceptInvalidServerCertificate::new()));
+        }
+        let mut h2 = base.clone();
+        h2.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        Ok(Self {
+            no_alpn: tokio_rustls::TlsConnector::from(Arc::new(base)),
+            with_h2: tokio_rustls::TlsConnector::from(Arc::new(h2)),
+        })
+    }
+
+    async fn send_request<B>(
+        &self,
+        request: Request<B>,
+    ) -> anyhow::Result<(
+        Response<Incoming>,
+        Option<JoinHandle<Result<Upgraded, http_mitm_proxy::hyper::Error>>>,
+    )>
+    where
+        B: Body<Data = Bytes> + Send + Sync + 'static,
+        B::Data: Send + Buf,
+        B::Error: Into<DynError>,
+    {
+        let target_uri = request.uri().clone();
+        let (host, port, is_tls) = upstream_host_port(&target_uri)?;
+        let tcp = TcpStream::connect((host.as_str(), port))
+            .await
+            .with_context(|| format!("failed to connect to upstream {host}:{port}"))?;
+        let _ = tcp.set_nodelay(true);
+        let mut sender = if is_tls {
+            let connector = if request.version() == Version::HTTP_2 {
+                &self.with_h2
+            } else {
+                &self.no_alpn
+            };
+            let server_name = ServerName::try_from(host.clone())
+                .map_err(|_| anyhow::anyhow!("invalid upstream TLS server name {host}"))?;
+            let tls = connector
+                .connect(server_name, tcp)
+                .await
+                .with_context(|| format!("upstream TLS handshake failed for {host}:{port}"))?;
+            if tls.get_ref().1.alpn_protocol() == Some(b"h2") {
+                let (sender, connection) = client::conn::http2::Builder::new(TokioExecutor::new())
+                    .handshake(TokioIo::new(tls))
+                    .await
+                    .with_context(|| {
+                        format!("upstream HTTP/2 handshake failed for {target_uri}")
+                    })?;
+                tokio::spawn(connection);
+                CustomSender::Http2(sender)
+            } else {
+                let (sender, connection) = client::conn::http1::Builder::new()
+                    .preserve_header_case(true)
+                    .title_case_headers(true)
+                    .handshake(TokioIo::new(tls))
+                    .await
+                    .with_context(|| {
+                        format!("upstream HTTP/1 handshake failed for {target_uri}")
+                    })?;
+                tokio::spawn(connection.with_upgrades());
+                CustomSender::Http1(sender)
+            }
+        } else {
+            let (sender, connection) = client::conn::http1::Builder::new()
+                .preserve_header_case(true)
+                .title_case_headers(true)
+                .handshake(TokioIo::new(tcp))
+                .await
+                .with_context(|| format!("upstream HTTP/1 handshake failed for {target_uri}"))?;
+            tokio::spawn(connection.with_upgrades());
+            CustomSender::Http1(sender)
+        };
+
+        let (request_parts, request_body) = request.into_parts();
+        let boxed_request = Request::from_parts(
+            request_parts.clone(),
+            request_body.map_err(Into::into).boxed(),
+        );
+        let response = sender
+            .send_request(boxed_request)
+            .await
+            .with_context(|| format!("upstream request failed for {target_uri}"))?;
+        if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+            return Ok((response, None));
+        }
+
+        let (response_parts, response_body) = response.into_parts();
+        let client_request = Request::from_parts(request_parts, Empty::<Bytes>::new());
+        let server_response = Response::from_parts(response_parts.clone(), Empty::<Bytes>::new());
+        let upgrade = tokio::spawn(async move {
+            let client = http_mitm_proxy::hyper::upgrade::on(client_request).await?;
+            let server = http_mitm_proxy::hyper::upgrade::on(server_response).await?;
+            Ok(Upgraded {
+                client: TokioIo::new(client),
+                server: TokioIo::new(server),
+            })
+        });
+        Ok((
+            Response::from_parts(response_parts, response_body),
+            Some(upgrade),
+        ))
+    }
+}
+
+type UpstreamBody = BoxBody<Bytes, DynError>;
+
+enum CustomSender {
+    Http1(client::conn::http1::SendRequest<UpstreamBody>),
+    Http2(client::conn::http2::SendRequest<UpstreamBody>),
+}
+
+impl CustomSender {
+    async fn send_request(
+        &mut self,
+        mut request: Request<UpstreamBody>,
+    ) -> Result<Response<Incoming>, http_mitm_proxy::hyper::Error> {
+        match self {
+            Self::Http1(sender) => {
+                if request.version() == Version::HTTP_2
+                    && let Some(authority) = request.uri().authority().cloned()
+                    && let Ok(host) = authority.as_str().parse::<header::HeaderValue>()
+                {
+                    request.headers_mut().insert(header::HOST, host);
+                }
+                remove_upstream_authority(&mut request);
+                sender.send_request(request).await
+            }
+            Self::Http2(sender) => {
+                if request.version() != Version::HTTP_2 {
+                    request.headers_mut().remove(header::HOST);
+                }
+                sender.send_request(request).await
+            }
+        }
+    }
+}
+
+fn upstream_host_port(uri: &Uri) -> anyhow::Result<(String, u16, bool)> {
+    let host = uri
+        .host()
+        .ok_or_else(|| anyhow::anyhow!("upstream URL has no host: {uri}"))?
+        .to_owned();
+    let is_tls = uri.scheme_str() == Some("https");
+    Ok((
+        host,
+        uri.port_u16().unwrap_or(if is_tls { 443 } else { 80 }),
+        is_tls,
+    ))
+}
+
+fn remove_upstream_authority<B>(request: &mut Request<B>) {
+    let mut parts = request.uri().clone().into_parts();
+    parts.scheme = None;
+    parts.authority = None;
+    if let Ok(uri) = Uri::from_parts(parts) {
+        *request.uri_mut() = uri;
+    }
+}
+
+#[derive(Debug)]
+struct AcceptInvalidServerCertificate {
+    schemes: Vec<SignatureScheme>,
+}
+
+impl AcceptInvalidServerCertificate {
+    fn new() -> Self {
+        Self {
+            schemes: rustls::crypto::aws_lc_rs::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes(),
+        }
+    }
+}
+
+impl ServerCertVerifier for AcceptInvalidServerCertificate {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _certificate: &CertificateDer<'_>,
+        _signature: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _certificate: &CertificateDer<'_>,
+        _signature: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.schemes.clone()
+    }
+}
+
 pub async fn start_proxy(data_dir: &Path, config: ProxyConfig) -> anyhow::Result<ProxyRuntime> {
     if !config.bind.ip().is_loopback() {
         bail!("the capture proxy may only bind to a loopback address");
@@ -158,7 +503,7 @@ pub async fn start_proxy(data_dir: &Path, config: ProxyConfig) -> anyhow::Result
         Some(ca.issuer),
         Some(Cache::new(config.certificate_cache_entries)),
     ));
-    let client = DefaultClient::new().with_upgrades();
+    let client = UpstreamClient::new(&config.upstream_tls)?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let max_body_bytes = config.max_body_bytes;
     let task = tokio::spawn(run_listener(
@@ -185,7 +530,7 @@ pub async fn start_proxy(data_dir: &Path, config: ProxyConfig) -> anyhow::Result
 async fn run_listener(
     listener: TcpListener,
     proxy: Arc<MitmProxy<Issuer<'static, KeyPair>>>,
-    client: DefaultClient,
+    client: UpstreamClient,
     sink: CaptureSink,
     max_body_bytes: usize,
     mut shutdown: watch::Receiver<bool>,
@@ -260,7 +605,7 @@ async fn run_listener(
 
 async fn capture_request(
     mut request: Request<Incoming>,
-    client: DefaultClient,
+    client: UpstreamClient,
     sink: CaptureSink,
     max_body_bytes: usize,
     relays: TaskTracker,
@@ -1029,7 +1374,7 @@ fn generate_ca() -> anyhow::Result<PersistedCa> {
     })
 }
 
-fn atomic_write(path: &Path, bytes: &[u8], secret: bool) -> anyhow::Result<()> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8], secret: bool) -> anyhow::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", path.display()))?;
@@ -1070,6 +1415,25 @@ fn atomic_write(path: &Path, bytes: &[u8], secret: bool) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    #[test]
+    fn custom_ca_normalization_drops_private_key_material() {
+        let mut params = CertificateParams::new(Vec::new()).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let key = KeyPair::generate().unwrap();
+        let certificate = params.self_signed(&key).unwrap();
+        let bundle = format!("{}\n{}", certificate.pem(), key.serialize_pem());
+
+        let normalized = UpstreamTlsConfig::CustomCa { ca_pem: bundle }
+            .normalized()
+            .unwrap();
+        let UpstreamTlsConfig::CustomCa { ca_pem } = normalized else {
+            panic!("custom CA normalization changed the mode");
+        };
+        assert!(ca_pem.contains("BEGIN CERTIFICATE"));
+        assert!(!ca_pem.contains("PRIVATE KEY"));
+        assert_eq!(ca_pem.matches("BEGIN CERTIFICATE").count(), 1);
+    }
 
     #[test]
     fn ca_is_persisted_and_reloaded() {
@@ -1125,6 +1489,97 @@ mod tests {
             (Some(1000), Some("bye".into()))
         );
         assert_eq!(parse_close_payload(&[0xff]), (None, None));
+    }
+
+    #[test]
+    fn upstream_tls_defaults_to_certificate_verification() {
+        assert_eq!(
+            ProxyConfig::default().upstream_tls,
+            UpstreamTlsConfig::Verify
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_trusts_an_explicit_upstream_ca_for_a_real_https_origin() {
+        let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_certificate = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = Issuer::new(ca_params, ca_key);
+
+        let server_key = KeyPair::generate().unwrap();
+        let mut server_params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+        server_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        server_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let server_certificate = server_params.signed_by(&server_key, &issuer).unwrap();
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![server_certificate.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(server_key.serialize_der()),
+                ),
+            )
+            .unwrap();
+        let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let origin = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let origin_address = origin.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            let (stream, _) = origin.accept().await.unwrap();
+            let mut stream = tls_acceptor.accept(stream).await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..read]).contains("GET /private-ca"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\naccepted",
+                )
+                .await
+                .unwrap();
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let ProxyRuntime { handle, mut events } = start_proxy(
+            temp.path(),
+            ProxyConfig {
+                upstream_tls: UpstreamTlsConfig::CustomCa {
+                    ca_pem: ca_certificate.pem(),
+                },
+                ..ProxyConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let proxy_url = format!("http://{}", handle.address());
+        let capture_ca = fs::read(handle.ca_certificate_path()).unwrap();
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(proxy_url).unwrap())
+            .add_root_certificate(reqwest::Certificate::from_pem(&capture_ca).unwrap())
+            .build()
+            .unwrap();
+        let response = client
+            .get(format!(
+                "https://localhost:{}/private-ca",
+                origin_address.port()
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "accepted");
+
+        let capture = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let ProxyCapture::Http(exchange) = capture else {
+            panic!("expected an HTTPS capture");
+        };
+        assert_eq!(exchange.response.unwrap().status, 200);
+
+        origin_task.await.unwrap();
+        handle.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -1343,6 +1798,165 @@ mod tests {
         }
         assert!(client_frame && server_frame);
 
+        origin_task.await.unwrap();
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn custom_upstream_ca_preserves_wss_upgrades() {
+        let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_certificate = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = Issuer::new(ca_params, ca_key);
+        let server_key = KeyPair::generate().unwrap();
+        let mut server_params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+        server_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        server_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let server_certificate = server_params.signed_by(&server_key, &issuer).unwrap();
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![server_certificate.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(server_key.serialize_der()),
+                ),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let origin = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let origin_address = origin.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            let (stream, _) = origin.accept().await.unwrap();
+            let stream = acceptor.accept(stream).await.unwrap();
+            let service = service_fn(|mut request: Request<Incoming>| async move {
+                let (response, upgrade) = fastwebsockets::upgrade::upgrade(&mut request)?;
+                tokio::spawn(async move {
+                    let mut websocket = upgrade.await.unwrap();
+                    loop {
+                        let frame = websocket.read_frame().await.unwrap();
+                        let opcode = frame.opcode;
+                        if matches!(opcode, OpCode::Text | OpCode::Binary) {
+                            websocket.write_frame(frame).await.unwrap();
+                        }
+                        if opcode == OpCode::Close {
+                            break;
+                        }
+                    }
+                });
+                Ok::<_, WebSocketError>(response)
+            });
+            server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .with_upgrades()
+                .await
+                .unwrap();
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let ProxyRuntime { handle, mut events } = start_proxy(
+            temp.path(),
+            ProxyConfig {
+                upstream_tls: UpstreamTlsConfig::CustomCa {
+                    ca_pem: ca_certificate.pem(),
+                },
+                ..ProxyConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut tunnel = TcpStream::connect(handle.address()).await.unwrap();
+        tunnel
+            .write_all(
+                format!(
+                    "CONNECT localhost:{} HTTP/1.1\r\nHost: localhost:{}\r\n\r\n",
+                    origin_address.port(),
+                    origin_address.port()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut connect_response = Vec::new();
+        while !connect_response.ends_with(b"\r\n\r\n") {
+            let mut byte = [0_u8; 1];
+            tunnel.read_exact(&mut byte).await.unwrap();
+            connect_response.push(byte[0]);
+        }
+        assert!(String::from_utf8_lossy(&connect_response).contains("200"));
+
+        let mut roots = RootCertStore::empty();
+        let capture_ca = fs::read(handle.ca_certificate_path()).unwrap();
+        let mut reader = BufReader::new(capture_ca.as_slice());
+        for certificate in rustls_pemfile::certs(&mut reader) {
+            roots.add(certificate.unwrap()).unwrap();
+        }
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+        let mut tunnel = connector
+            .connect(ServerName::try_from("localhost").unwrap(), tunnel)
+            .await
+            .unwrap();
+        let key = fastwebsockets::handshake::generate_key();
+        tunnel
+            .write_all(
+                format!(
+                    "GET /socket HTTP/1.1\r\nHost: localhost:{}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n",
+                    origin_address.port()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut handshake = Vec::new();
+        while !handshake.ends_with(b"\r\n\r\n") {
+            let mut byte = [0_u8; 1];
+            tunnel.read_exact(&mut byte).await.unwrap();
+            handshake.push(byte[0]);
+        }
+        assert!(String::from_utf8_lossy(&handshake).starts_with("HTTP/1.1 101"));
+
+        let mut websocket = fastwebsockets::WebSocket::after_handshake(tunnel, Role::Client);
+        websocket
+            .write_frame(fastwebsockets::Frame::text(fastwebsockets::Payload::Owned(
+                b"wss custom CA".to_vec(),
+            )))
+            .await
+            .unwrap();
+        assert_eq!(
+            &*websocket.read_frame().await.unwrap().payload,
+            b"wss custom CA"
+        );
+        websocket
+            .write_frame(fastwebsockets::Frame::close(1000, b"done"))
+            .await
+            .unwrap();
+
+        let mut client_frame = false;
+        let mut server_frame = false;
+        for _ in 0..8 {
+            let capture = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if let ProxyCapture::WebSocket(frame) = capture
+                && frame.kind.as_str() == "frame"
+                && frame.opcode == Some(OpCode::Text as u8)
+            {
+                match frame.direction {
+                    Some(WebSocketDirection::ClientToServer) => client_frame = true,
+                    Some(WebSocketDirection::ServerToClient) => server_frame = true,
+                    None => {}
+                }
+            }
+            if client_frame && server_frame {
+                break;
+            }
+        }
+        assert!(client_frame && server_frame);
         origin_task.await.unwrap();
         handle.shutdown().await.unwrap();
     }

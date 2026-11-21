@@ -1,6 +1,6 @@
 # Erebus Web Runtime
 
-`erebus-webd` is the local web traffic runtime for [Erebus](https://github.com/rafabd1/Erebus).
+`erebus-webd` is the local web traffic runtime for [Erebus](https://github.com/Vyntra-Research/Erebus).
 
 It captures HTTP, HTTPS, HTTP/2, and WebSocket traffic from isolated browser sessions, then turns that traffic into searchable history and an actionable site map. Requests keep their exact variants while shared bodies use content-addressed storage.
 

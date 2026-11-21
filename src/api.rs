@@ -10,13 +10,15 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use rand::RngCore as _;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Semaphore};
+use tokio_util::sync::CancellationToken;
 
 use crate::capture::{CaptureManager, CaptureProxyDescriptor};
 use crate::config::Config;
 use crate::error::AppError;
 use crate::model::*;
+use crate::proxy::UpstreamTlsConfig;
 use crate::replay::{self, ReplayPreparation};
 use crate::store::Store;
 
@@ -31,6 +33,7 @@ pub struct AppState {
     captures: CaptureManager,
     pairings: PairingTokens,
     blocking_slots: Arc<Semaphore>,
+    shutdown: CancellationToken,
 }
 
 impl AppState {
@@ -42,11 +45,16 @@ impl AppState {
             captures,
             pairings: PairingTokens::default(),
             blocking_slots: Arc::new(Semaphore::new(MAX_BLOCKING_TASKS)),
+            shutdown: CancellationToken::new(),
         }
     }
 
     pub fn captures(&self) -> CaptureManager {
         self.captures.clone()
+    }
+
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown.clone()
     }
 
     async fn run_blocking<T, F>(&self, work: F) -> Result<T, AppError>
@@ -162,6 +170,7 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{id}/proxy/start", post(start_session_proxy))
         .route("/sessions/{id}/proxy/stop", post(stop_session_proxy))
         .route("/sessions/{id}/pairing", post(create_pairing))
+        .route("/shutdown", post(request_shutdown))
         .route("/proxy/ca", get(proxy_ca))
         .route("/scope", get(list_scope).post(save_scope))
         .route(
@@ -242,10 +251,33 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
     })
 }
 
+async fn request_shutdown(State(state): State<AppState>) -> StatusCode {
+    let shutdown = state.shutdown.clone();
+    tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        shutdown.cancel();
+    });
+    StatusCode::ACCEPTED
+}
+
 #[derive(serde::Deserialize, Default)]
 struct CreateSessionQuery {
     #[serde(default)]
     proxy: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateSessionRequest {
+    #[serde(flatten)]
+    session: CreateSession,
+    upstream_tls: Option<UpstreamTlsConfig>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProxyStartRequest {
+    upstream_tls: Option<UpstreamTlsConfig>,
 }
 
 #[derive(Serialize)]
@@ -254,19 +286,29 @@ struct CaptureSessionView {
     #[serde(flatten)]
     session: CaptureSession,
     proxy: Option<CaptureProxyDescriptor>,
+    upstream_tls_mode: String,
 }
 
 async fn create_session(
     State(state): State<AppState>,
     Query(query): Query<CreateSessionQuery>,
-    Json(input): Json<CreateSession>,
+    Json(input): Json<CreateSessionRequest>,
 ) -> Result<Json<CaptureSessionView>, AppError> {
     let store = state.store.clone();
+    if !query.proxy && input.upstream_tls.is_some() {
+        return Err(AppError::InvalidInput(
+            "upstreamTls requires proxy=true".into(),
+        ));
+    }
+    let upstream_tls = input.upstream_tls.unwrap_or_default();
+    upstream_tls
+        .validate()
+        .map_err(|error| AppError::InvalidInput(error.to_string()))?;
     let session = state
-        .run_blocking(move || store.create_session(input))
+        .run_blocking(move || store.create_session(input.session))
         .await?;
     let proxy = if query.proxy {
-        match state.captures.start(&session.id).await {
+        match state.captures.start(&session.id, Some(upstream_tls)).await {
             Ok(proxy) => Some(proxy),
             Err(error) => {
                 let session_id = session.id.clone();
@@ -280,7 +322,15 @@ async fn create_session(
     } else {
         None
     };
-    Ok(Json(CaptureSessionView { session, proxy }))
+    let upstream_tls_mode = state
+        .captures
+        .upstream_tls_mode(&session.id)
+        .map_err(AppError::Storage)?;
+    Ok(Json(CaptureSessionView {
+        session,
+        proxy,
+        upstream_tls_mode,
+    }))
 }
 
 async fn list_sessions(
@@ -291,7 +341,15 @@ async fn list_sessions(
     let mut views = Vec::with_capacity(sessions.len());
     for session in sessions {
         let proxy = state.captures.descriptor(&session.id).await;
-        views.push(CaptureSessionView { session, proxy });
+        let upstream_tls_mode = state
+            .captures
+            .upstream_tls_mode(&session.id)
+            .map_err(AppError::Storage)?;
+        views.push(CaptureSessionView {
+            session,
+            proxy,
+            upstream_tls_mode,
+        });
     }
     Ok(Json(views))
 }
@@ -307,12 +365,21 @@ async fn get_session(
         .await?
         .ok_or(AppError::NotFound)?;
     let proxy = state.captures.descriptor(&id).await;
-    Ok(Json(CaptureSessionView { session, proxy }))
+    let upstream_tls_mode = state
+        .captures
+        .upstream_tls_mode(&id)
+        .map_err(AppError::Storage)?;
+    Ok(Json(CaptureSessionView {
+        session,
+        proxy,
+        upstream_tls_mode,
+    }))
 }
 
 async fn start_session_proxy(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    input: Option<Json<ProxyStartRequest>>,
 ) -> Result<Json<CaptureSessionView>, AppError> {
     let store = state.store.clone();
     let lookup_id = id.clone();
@@ -325,10 +392,22 @@ async fn start_session_proxy(
             "ended capture sessions cannot restart their proxy".into(),
         ));
     }
-    let proxy = state.captures.start(&id).await.map_err(AppError::Storage)?;
+    let upstream_tls = input.and_then(|Json(input)| input.upstream_tls);
+    if let Some(config) = upstream_tls.as_ref() {
+        config
+            .validate()
+            .map_err(|error| AppError::InvalidInput(error.to_string()))?;
+    }
+    let proxy = state
+        .captures
+        .start(&id, upstream_tls)
+        .await
+        .map_err(AppError::Storage)?;
+    let upstream_tls_mode = proxy.upstream_tls_mode.clone();
     Ok(Json(CaptureSessionView {
         session,
         proxy: Some(proxy),
+        upstream_tls_mode,
     }))
 }
 
@@ -348,9 +427,14 @@ async fn stop_session_proxy(
         ));
     }
     state.captures.stop(&id).await.map_err(AppError::Storage)?;
+    let upstream_tls_mode = state
+        .captures
+        .upstream_tls_mode(&id)
+        .map_err(AppError::Storage)?;
     Ok(Json(CaptureSessionView {
         session,
         proxy: None,
+        upstream_tls_mode,
     }))
 }
 
@@ -385,10 +469,18 @@ async fn end_session(
         .run_blocking(move || store.end_session(&session_id))
         .await?
         .ok_or(AppError::NotFound)?;
+    let upstream_tls_mode = state
+        .captures
+        .upstream_tls_mode(&id)
+        .unwrap_or_else(|_| "verify".into());
     state.pairings.revoke_session(&id).await;
+    if let Err(error) = state.captures.forget_upstream_tls(&id) {
+        tracing::warn!(session_id = %id, %error, "could not remove ended session TLS settings");
+    }
     Ok(Json(CaptureSessionView {
         session,
         proxy: None,
+        upstream_tls_mode,
     }))
 }
 
@@ -408,6 +500,9 @@ async fn delete_session(
         .await?
         .ok_or(AppError::NotFound)?;
     state.pairings.revoke_session(&id).await;
+    if let Err(error) = state.captures.forget_upstream_tls(&id) {
+        tracing::warn!(session_id = %id, %error, "could not remove deleted session TLS settings");
+    }
     Ok(Json(deleted))
 }
 
@@ -527,9 +622,13 @@ async fn replay_request(
     State(state): State<AppState>,
     Json(input): Json<ReplayRequest>,
 ) -> Result<Json<ReplayResult>, AppError> {
+    let upstream_tls = state
+        .captures
+        .upstream_tls(&input.session_id)
+        .map_err(AppError::Storage)?;
     let store = state.store.clone();
     let preparation = state
-        .run_blocking(move || replay::prepare(&store, input))
+        .run_blocking(move || replay::prepare(&store, input, &upstream_tls))
         .await?;
     let prepared = match preparation {
         ReplayPreparation::Existing(result) => return Ok(Json(result)),
@@ -972,6 +1071,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_shutdown_requests_graceful_runtime_stop() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            data_dir: temp.path().to_path_buf(),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token: Some("master-token".into()),
+        }
+        .prepare()
+        .unwrap();
+        let store = Arc::new(Store::open(&config.data_dir).unwrap());
+        let state = AppState::new(config, store);
+        let shutdown = state.shutdown_token();
+        let app = router(state);
+
+        let unauthorized = call(&app, "POST", "/v1/shutdown", "wrong-token", None).await;
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert!(!shutdown.is_cancelled());
+
+        let accepted = call(&app, "POST", "/v1/shutdown", "master-token", None).await;
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        tokio::time::timeout(std::time::Duration::from_secs(1), shutdown.cancelled())
+            .await
+            .expect("shutdown signal was not delivered");
+    }
+
+    #[tokio::test]
     async fn proxy_lifecycle_is_idempotent_and_session_bound() {
         let temp = tempfile::tempdir().unwrap();
         let config = Config {
@@ -992,7 +1117,14 @@ mod tests {
         let app = router(AppState::new(config, store));
 
         let start_path = format!("/v1/sessions/{}/proxy/start", session.id);
-        let first = call(&app, "POST", &start_path, "master-token", None).await;
+        let first = call(
+            &app,
+            "POST",
+            &start_path,
+            "master-token",
+            Some(json!({ "upstreamTls": { "mode": "insecure" } })),
+        )
+        .await;
         assert_eq!(first.status(), StatusCode::OK);
         let first_body = to_bytes(first.into_body(), 16 * 1024).await.unwrap();
         let first_body: Value = serde_json::from_slice(&first_body).unwrap();
@@ -1001,6 +1133,7 @@ mod tests {
         let second_body = to_bytes(second.into_body(), 16 * 1024).await.unwrap();
         let second_body: Value = serde_json::from_slice(&second_body).unwrap();
         assert_eq!(first_body["proxy"]["url"], second_body["proxy"]["url"]);
+        assert_eq!(first_body["proxy"]["upstreamTlsMode"], "insecure");
 
         let delete = call(
             &app,
@@ -1013,6 +1146,17 @@ mod tests {
         assert_eq!(delete.status(), StatusCode::BAD_REQUEST);
 
         let stop_path = format!("/v1/sessions/{}/proxy/stop", session.id);
+        assert_eq!(
+            call(&app, "POST", &stop_path, "master-token", None)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let resumed = call(&app, "POST", &start_path, "master-token", None).await;
+        assert_eq!(resumed.status(), StatusCode::OK);
+        let resumed = to_bytes(resumed.into_body(), 16 * 1024).await.unwrap();
+        let resumed: Value = serde_json::from_slice(&resumed).unwrap();
+        assert_eq!(resumed["proxy"]["upstreamTlsMode"], "insecure");
         assert_eq!(
             call(&app, "POST", &stop_path, "master-token", None)
                 .await

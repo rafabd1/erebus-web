@@ -16,6 +16,7 @@ use crate::model::{
     BodyEncoding, BodyState, CapturedBody, CapturedRequest, CapturedResponse, HeaderField,
     HttpCaptureEvent, HttpIngestBatch, IngestStatus, ReplayRequest, ReplayResult,
 };
+use crate::proxy::UpstreamTlsConfig;
 use crate::store::{MAX_BODY_BYTES, ReplayRecord, ReplaySourceRequest, Store, invalid};
 
 const REPLAY_SEQUENCE: u64 = 1;
@@ -53,7 +54,11 @@ pub struct CompletedReplay {
     event: HttpCaptureEvent,
 }
 
-pub fn prepare(store: &Store, input: ReplayRequest) -> anyhow::Result<ReplayPreparation> {
+pub fn prepare(
+    store: &Store,
+    input: ReplayRequest,
+    upstream_tls: &UpstreamTlsConfig,
+) -> anyhow::Result<ReplayPreparation> {
     validate_identifier("observationId", &input.observation_id)?;
     validate_identifier("sessionId", &input.session_id)?;
     let replay_id = match input.replay_id.as_deref() {
@@ -94,10 +99,32 @@ pub fn prepare(store: &Store, input: ReplayRequest) -> anyhow::Result<ReplayPrep
     } else {
         Policy::none()
     };
-    let client = Client::builder()
+    let mut client = Client::builder()
         .redirect(redirect_policy)
         .timeout(Duration::from_millis(timeout_ms))
-        .connect_timeout(Duration::from_millis(timeout_ms.min(30_000)))
+        .connect_timeout(Duration::from_millis(timeout_ms.min(30_000)));
+    match upstream_tls {
+        UpstreamTlsConfig::Verify => {}
+        UpstreamTlsConfig::CustomCa { ca_pem } => {
+            let mut reader = std::io::BufReader::new(ca_pem.as_bytes());
+            let certificates = rustls_pemfile::certs(&mut reader)
+                .collect::<Result<Vec<_>, _>>()
+                .context("the replay upstream CA PEM is invalid")?;
+            if certificates.is_empty() {
+                bail!("the replay upstream CA PEM does not contain a certificate");
+            }
+            for certificate in certificates {
+                client = client.add_root_certificate(
+                    reqwest::Certificate::from_der(certificate.as_ref())
+                        .context("the replay upstream CA certificate is invalid")?,
+                );
+            }
+        }
+        UpstreamTlsConfig::Insecure => {
+            client = client.danger_accept_invalid_certs(true);
+        }
+    }
+    let client = client
         .build()
         .context("failed to build replay HTTP client")?;
 
@@ -454,7 +481,7 @@ mod tests {
     use std::sync::Arc;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::net::TcpListener;
     use tokio::sync::mpsc;
 
     use super::*;
@@ -601,7 +628,7 @@ mod tests {
             2
         );
 
-        match prepare(&store, first_input).unwrap() {
+        match prepare(&store, first_input, &UpstreamTlsConfig::Verify).unwrap() {
             ReplayPreparation::Existing(existing) => {
                 assert_eq!(existing.observation_id, first.observation_id)
             }
@@ -680,8 +707,79 @@ mod tests {
         assert_eq!(body.original_size, response_size);
     }
 
+    #[tokio::test]
+    async fn replay_uses_the_destination_sessions_custom_upstream_ca() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let source_session = store
+            .create_session(CreateSession {
+                label: "source".into(),
+                source: "test".into(),
+                scope_profile_id: None,
+            })
+            .unwrap();
+        let destination_session = store
+            .create_session(CreateSession {
+                label: "destination".into(),
+                source: "replay".into(),
+                scope_profile_id: None,
+            })
+            .unwrap();
+        let (origin, ca_pem, server) = spawn_tls_origin().await;
+        let source_id = store
+            .ingest_http(HttpIngestBatch {
+                producer_id: "tls-seed".into(),
+                session_id: source_session.id,
+                events: vec![HttpCaptureEvent {
+                    sequence: 1,
+                    captured_at: None,
+                    duration_ms: None,
+                    request: CapturedRequest {
+                        method: "GET".into(),
+                        url: format!("{origin}/custom-ca"),
+                        headers: vec![],
+                        body: Some(captured_body(&[])),
+                    },
+                    response: None,
+                    error: None,
+                    tab_id: None,
+                    initiator: None,
+                    parent_sequence: None,
+                    metadata: json!({}),
+                }],
+            })
+            .unwrap()
+            .remove(0)
+            .observation_id
+            .unwrap();
+        let prepared = match prepare(
+            &store,
+            ReplayRequest {
+                observation_id: source_id,
+                session_id: destination_session.id,
+                replay_id: Some("custom-ca-replay".into()),
+                method: None,
+                url: None,
+                headers: None,
+                body: None,
+                follow_redirects: false,
+                timeout_ms: Some(5_000),
+            },
+            &UpstreamTlsConfig::CustomCa { ca_pem },
+        )
+        .unwrap()
+        {
+            ReplayPreparation::Ready(prepared) => *prepared,
+            _ => panic!("new replay should be ready"),
+        };
+        let result = persist(&store, execute(prepared).await).unwrap();
+        server.await.unwrap();
+        assert_eq!(result.status, Some(200));
+        assert_eq!(result.error, None);
+    }
+
     async fn run_replay(store: &Store, input: ReplayRequest) -> ReplayResult {
-        let prepared = match prepare(store, input).unwrap() {
+        let prepared = match prepare(store, input, &UpstreamTlsConfig::Verify).unwrap() {
             ReplayPreparation::Ready(prepared) => *prepared,
             _ => panic!("new replay should be ready"),
         };
@@ -722,7 +820,54 @@ mod tests {
         (format!("http://{address}"), receiver, server)
     }
 
-    async fn read_request(stream: &mut TcpStream) -> Vec<u8> {
+    async fn spawn_tls_origin() -> (String, String, tokio::task::JoinHandle<()>) {
+        let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_certificate = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = rcgen::Issuer::new(ca_params, ca_key);
+        let server_key = rcgen::KeyPair::generate().unwrap();
+        let mut server_params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        server_params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        server_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let server_certificate = server_params.signed_by(&server_key, &issuer).unwrap();
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![server_certificate.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(server_key.serialize_der()),
+                ),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = acceptor.accept(stream).await.unwrap();
+            let _ = read_request(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        (
+            format!("https://localhost:{}", address.port()),
+            ca_certificate.pem(),
+            server,
+        )
+    }
+
+    async fn read_request<S>(stream: &mut S) -> Vec<u8>
+    where
+        S: tokio::io::AsyncRead + Unpin,
+    {
         let mut request = Vec::new();
         let header_end = loop {
             let mut chunk = [0_u8; 8 * 1024];

@@ -18,6 +18,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::Parser;
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -40,6 +41,7 @@ async fn main() -> anyhow::Result<()> {
     let store = Arc::new(Store::open(&config.data_dir).context("failed to open traffic store")?);
     let state = AppState::new(config.clone(), store);
     let captures = state.captures();
+    let api_shutdown = state.shutdown_token();
     let app = router(state).layer(TraceLayer::new_for_http());
     let listener = TcpListener::bind(config.bind)
         .await
@@ -50,14 +52,17 @@ async fn main() -> anyhow::Result<()> {
     println!("EREBUS_WEB_READY http://{address}");
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(api_shutdown, captures.clone()))
         .await
         .context("local API stopped unexpectedly")?;
     captures.shutdown_all().await;
     Ok(())
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(
+    api_shutdown: CancellationToken,
+    captures: crate::capture::CaptureManager,
+) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -96,5 +101,7 @@ async fn shutdown_signal() {
         () = ctrl_c => {},
         () = terminate => {},
         _ = parent_closed => {},
+        _ = api_shutdown.cancelled() => {},
     }
+    captures.shutdown_all().await;
 }
