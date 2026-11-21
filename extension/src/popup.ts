@@ -1,5 +1,7 @@
 import type { ExtensionState, PopupRequest, PopupResponse } from "./protocol";
+import { parsePairingRecord } from "./pairing-record";
 
+const pairingRecord = textarea("pairing-record");
 const serverUrl = input("server-url");
 const token = input("token");
 const sessionId = input("session-id");
@@ -12,12 +14,26 @@ const error = element("error");
 const pairingLock = element("pairing-lock");
 let latestState: ExtensionState | undefined;
 const buttons = {
+  importPairing: button("import-pairing"),
   save: button("save"),
   start: button("start"),
   stop: button("stop"),
   flush: button("flush"),
   discard: button("discard")
 };
+
+buttons.importPairing.addEventListener("click", () => {
+  hideError();
+  try {
+    const record = parsePairingRecord(pairingRecord.value);
+    serverUrl.value = record.serverUrl;
+    token.value = record.token;
+    sessionId.value = record.sessionId;
+    void run({ type: "saveConfig", ...record });
+  } catch (cause) {
+    showError(message(cause));
+  }
+});
 
 buttons.save.addEventListener("click", () =>
   run({
@@ -79,6 +95,7 @@ function render(state: ExtensionState): void {
   buttons.discard.disabled = state.queued === 0;
   serverUrl.disabled = state.pairingLocked;
   sessionId.disabled = state.pairingLocked;
+  pairingRecord.disabled = state.pairingLocked;
   pairingLock.hidden = !state.pairingLocked;
   pairingLock.textContent = state.pairingLocked
     ? "Runtime and session stay locked while capture is active or events are queued. The token can still be updated."
@@ -123,6 +140,7 @@ function setBusy(busy: boolean): void {
     buttons.discard.disabled = latestState.queued === 0;
     serverUrl.disabled = latestState.pairingLocked;
     sessionId.disabled = latestState.pairingLocked;
+    pairingRecord.disabled = latestState.pairingLocked;
   }
 }
 
@@ -138,6 +156,10 @@ function hideError(): void {
 
 function input(id: string): HTMLInputElement {
   return document.getElementById(id) as HTMLInputElement;
+}
+
+function textarea(id: string): HTMLTextAreaElement {
+  return document.getElementById(id) as HTMLTextAreaElement;
 }
 
 function button(id: string): HTMLButtonElement {

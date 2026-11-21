@@ -1079,7 +1079,10 @@ impl Store {
             values.push(like.clone().into());
             values.push(like.into());
         }
-        if query.in_scope_only {
+        if let Some(scope) = query.scope {
+            sql.push_str(" AND ge.scope_state = ?");
+            values.push(scope.as_str().to_owned().into());
+        } else if query.in_scope_only {
             sql.push_str(" AND ge.scope_state = 'in_scope'");
         }
         sql.push_str(
@@ -1098,6 +1101,7 @@ impl Store {
         &self,
         id: &str,
         session_id: Option<&str>,
+        scope: Option<ScopeState>,
         in_scope_only: bool,
     ) -> anyhow::Result<Option<GraphNeighborhood>> {
         let connection = self.reader()?;
@@ -1113,7 +1117,10 @@ impl Store {
             center_sql.push_str(" AND ge.session_id = ?");
             center_values.push(session_id.to_owned().into());
         }
-        if in_scope_only {
+        if let Some(scope) = scope {
+            center_sql.push_str(" AND ge.scope_state = ?");
+            center_values.push(scope.as_str().to_owned().into());
+        } else if in_scope_only {
             center_sql.push_str(" AND ge.scope_state = 'in_scope'");
         }
         center_sql.push_str(" GROUP BY n.id, n.kind, n.canonical_key, n.label, n.metadata_json");
@@ -1152,7 +1159,10 @@ impl Store {
             neighbor_sql.push_str(" AND gee.session_id = ?");
             neighbor_values.push(session_id.to_owned().into());
         }
-        if in_scope_only {
+        if let Some(scope) = scope {
+            neighbor_sql.push_str(" AND gee.scope_state = ?");
+            neighbor_values.push(scope.as_str().to_owned().into());
+        } else if in_scope_only {
             neighbor_sql.push_str(" AND gee.scope_state = 'in_scope'");
         }
         neighbor_sql.push(')');
@@ -1160,7 +1170,10 @@ impl Store {
             neighbor_sql.push_str(" AND ge.session_id = ?");
             neighbor_values.push(session_id.to_owned().into());
         }
-        if in_scope_only {
+        if let Some(scope) = scope {
+            neighbor_sql.push_str(" AND ge.scope_state = ?");
+            neighbor_values.push(scope.as_str().to_owned().into());
+        } else if in_scope_only {
             neighbor_sql.push_str(" AND ge.scope_state = 'in_scope'");
         }
         neighbor_sql.push_str(
@@ -1193,7 +1206,10 @@ impl Store {
             edge_sql.push_str(" AND gee.session_id = ?");
             edge_values.push(session_id.to_owned().into());
         }
-        if in_scope_only {
+        if let Some(scope) = scope {
+            edge_sql.push_str(" AND gee.scope_state = ?");
+            edge_values.push(scope.as_str().to_owned().into());
+        } else if in_scope_only {
             edge_sql.push_str(" AND gee.scope_state = 'in_scope'");
         }
         edge_sql.push_str(
@@ -2523,11 +2539,11 @@ mod tests {
             .pop()
             .unwrap();
         let first_neighbors = store
-            .graph_neighborhood(&operation.id, Some(&first.id), true)
+            .graph_neighborhood(&operation.id, Some(&first.id), None, true)
             .unwrap()
             .unwrap();
         let second_neighbors = store
-            .graph_neighborhood(&operation.id, Some(&second.id), true)
+            .graph_neighborhood(&operation.id, Some(&second.id), None, true)
             .unwrap()
             .unwrap();
         assert!(
@@ -2553,6 +2569,104 @@ mod tests {
                 .nodes
                 .iter()
                 .all(|node| node.kind != "parameter" || node.label != "first")
+        );
+    }
+
+    #[test]
+    fn graph_scope_filter_selects_exact_evidence_for_nodes_and_edges() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let scope_profile_id = store
+            .save_scope_profile(SaveScopeProfile {
+                name: "target".into(),
+                rules: vec![ScopeRuleInput {
+                    action: ScopeAction::Include,
+                    matcher: ScopeMatcher::Host,
+                    pattern: "allowed.example".into(),
+                    enabled: true,
+                }],
+            })
+            .unwrap();
+        let session = store
+            .create_session(CreateSession {
+                label: "scoped".into(),
+                source: "proxy".into(),
+                scope_profile_id: Some(scope_profile_id),
+            })
+            .unwrap();
+        store
+            .ingest_http(HttpIngestBatch {
+                producer_id: "scope-filter".into(),
+                session_id: session.id.clone(),
+                events: vec![
+                    event(
+                        1,
+                        "https://allowed.example/in?token=1",
+                        "2026-11-20T10:00:00Z",
+                    ),
+                    event(
+                        2,
+                        "https://blocked.example/out?token=2",
+                        "2026-11-20T10:01:00Z",
+                    ),
+                ],
+            })
+            .unwrap();
+
+        let in_scope = store
+            .graph(GraphQuery {
+                session_id: Some(session.id.clone()),
+                kind: Some("host".into()),
+                scope: Some(ScopeState::InScope),
+                ..GraphQuery::default()
+            })
+            .unwrap();
+        assert_eq!(in_scope.nodes.len(), 1);
+        assert_eq!(in_scope.nodes[0].label, "allowed.example");
+
+        let out_of_scope = store
+            .graph(GraphQuery {
+                session_id: Some(session.id.clone()),
+                kind: Some("host".into()),
+                scope: Some(ScopeState::OutOfScope),
+                ..GraphQuery::default()
+            })
+            .unwrap();
+        assert_eq!(out_of_scope.nodes.len(), 1);
+        assert_eq!(out_of_scope.nodes[0].label, "blocked.example");
+
+        let operation = store
+            .graph(GraphQuery {
+                session_id: Some(session.id.clone()),
+                kind: Some("operation".into()),
+                scope: Some(ScopeState::OutOfScope),
+                ..GraphQuery::default()
+            })
+            .unwrap()
+            .nodes
+            .pop()
+            .unwrap();
+        let neighborhood = store
+            .graph_neighborhood(
+                &operation.id,
+                Some(&session.id),
+                Some(ScopeState::OutOfScope),
+                true,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(neighborhood.edges.len() >= 2);
+        assert!(
+            neighborhood
+                .nodes
+                .iter()
+                .any(|node| node.kind == "route" && node.label == "/out")
+        );
+        assert!(
+            neighborhood
+                .nodes
+                .iter()
+                .all(|node| node.label != "allowed.example")
         );
     }
 

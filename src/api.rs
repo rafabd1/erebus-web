@@ -606,6 +606,7 @@ async fn list_graph(
 #[serde(rename_all = "camelCase")]
 struct NeighborhoodQuery {
     session_id: Option<String>,
+    scope: Option<ScopeState>,
     #[serde(default = "default_true")]
     in_scope_only: bool,
 }
@@ -622,7 +623,12 @@ async fn get_graph_neighborhood(
     let store = state.store.clone();
     state
         .run_blocking(move || {
-            store.graph_neighborhood(&id, query.session_id.as_deref(), query.in_scope_only)
+            store.graph_neighborhood(
+                &id,
+                query.session_id.as_deref(),
+                query.scope,
+                query.in_scope_only,
+            )
         })
         .await?
         .map(Json)
@@ -943,6 +949,51 @@ mod tests {
             call(&app, "POST", &start_path, "master-token", None)
                 .await
                 .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_scope_query_accepts_exact_states_and_rejects_unknown_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            data_dir: temp.path().to_path_buf(),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token: Some("master-token".into()),
+        }
+        .prepare()
+        .unwrap();
+        let store = Arc::new(Store::open(&config.data_dir).unwrap());
+        let app = router(AppState::new(config, store));
+
+        assert_eq!(
+            call(
+                &app,
+                "GET",
+                "/v1/map?scope=out_of_scope&inScopeOnly=true",
+                "master-token",
+                None,
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(&app, "GET", "/v1/map?scope=invalid", "master-token", None,)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            call(
+                &app,
+                "GET",
+                "/v1/map/missing?scope=invalid",
+                "master-token",
+                None,
+            )
+            .await
+            .status(),
             StatusCode::BAD_REQUEST
         );
     }

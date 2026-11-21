@@ -68,7 +68,8 @@ label {
   color: #c9cdc6;
 }
 
-input {
+input,
+textarea {
   width: 100%;
   padding: 7px 8px;
   border: 1px solid #343a33;
@@ -78,8 +79,14 @@ input {
   color: inherit;
 }
 
-input:focus {
+input:focus,
+textarea:focus {
   border-color: #55aa7c;
+}
+
+textarea {
+  min-height: 54px;
+  resize: vertical;
 }
 
 button {

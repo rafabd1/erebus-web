@@ -335,7 +335,7 @@ pub struct ScopeDecision {
     pub reason: String,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ScopeState {
     InScope,
@@ -360,6 +360,7 @@ pub struct GraphQuery {
     pub kind: Option<String>,
     pub text: Option<String>,
     pub limit: Option<u32>,
+    pub scope: Option<ScopeState>,
     #[serde(default = "default_in_scope")]
     pub in_scope_only: bool,
 }
