@@ -286,7 +286,28 @@ struct CaptureSessionView {
     #[serde(flatten)]
     session: CaptureSession,
     proxy: Option<CaptureProxyDescriptor>,
+    proxy_state: &'static str,
     upstream_tls_mode: String,
+}
+
+impl CaptureSessionView {
+    fn new(
+        session: CaptureSession,
+        proxy: Option<CaptureProxyDescriptor>,
+        upstream_tls_mode: String,
+    ) -> Self {
+        let proxy_state = if proxy.is_some() {
+            "running"
+        } else {
+            "stopped"
+        };
+        Self {
+            session,
+            proxy,
+            proxy_state,
+            upstream_tls_mode,
+        }
+    }
 }
 
 async fn create_session(
@@ -326,11 +347,11 @@ async fn create_session(
         .captures
         .upstream_tls_mode(&session.id)
         .map_err(AppError::Storage)?;
-    Ok(Json(CaptureSessionView {
+    Ok(Json(CaptureSessionView::new(
         session,
         proxy,
         upstream_tls_mode,
-    }))
+    )))
 }
 
 async fn list_sessions(
@@ -345,11 +366,7 @@ async fn list_sessions(
             .captures
             .upstream_tls_mode(&session.id)
             .map_err(AppError::Storage)?;
-        views.push(CaptureSessionView {
-            session,
-            proxy,
-            upstream_tls_mode,
-        });
+        views.push(CaptureSessionView::new(session, proxy, upstream_tls_mode));
     }
     Ok(Json(views))
 }
@@ -369,11 +386,11 @@ async fn get_session(
         .captures
         .upstream_tls_mode(&id)
         .map_err(AppError::Storage)?;
-    Ok(Json(CaptureSessionView {
+    Ok(Json(CaptureSessionView::new(
         session,
         proxy,
         upstream_tls_mode,
-    }))
+    )))
 }
 
 async fn start_session_proxy(
@@ -404,11 +421,11 @@ async fn start_session_proxy(
         .await
         .map_err(AppError::Storage)?;
     let upstream_tls_mode = proxy.upstream_tls_mode.clone();
-    Ok(Json(CaptureSessionView {
+    Ok(Json(CaptureSessionView::new(
         session,
-        proxy: Some(proxy),
+        Some(proxy),
         upstream_tls_mode,
-    }))
+    )))
 }
 
 async fn stop_session_proxy(
@@ -431,11 +448,11 @@ async fn stop_session_proxy(
         .captures
         .upstream_tls_mode(&id)
         .map_err(AppError::Storage)?;
-    Ok(Json(CaptureSessionView {
+    Ok(Json(CaptureSessionView::new(
         session,
-        proxy: None,
+        None,
         upstream_tls_mode,
-    }))
+    )))
 }
 
 async fn create_pairing(
@@ -477,11 +494,11 @@ async fn end_session(
     if let Err(error) = state.captures.forget_upstream_tls(&id) {
         tracing::warn!(session_id = %id, %error, "could not remove ended session TLS settings");
     }
-    Ok(Json(CaptureSessionView {
+    Ok(Json(CaptureSessionView::new(
         session,
-        proxy: None,
+        None,
         upstream_tls_mode,
-    }))
+    )))
 }
 
 async fn delete_session(
@@ -741,12 +758,8 @@ async fn list_graph(
 struct NeighborhoodQuery {
     session_id: Option<String>,
     scope: Option<ScopeState>,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     in_scope_only: bool,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 async fn get_graph_neighborhood(
@@ -852,7 +865,9 @@ mod tests {
     use serde_json::{Value, json};
     use tower::ServiceExt as _;
 
-    use super::{AppState, PairingResolution, PairingTokens, constant_time_eq, router};
+    use super::{
+        AppState, NeighborhoodQuery, PairingResolution, PairingTokens, constant_time_eq, router,
+    };
     use crate::config::Config;
     use crate::model::CreateSession;
     use crate::store::Store;
@@ -862,6 +877,15 @@ mod tests {
         assert!(constant_time_eq(b"same", b"same"));
         assert!(!constant_time_eq(b"same", b"diff"));
         assert!(!constant_time_eq(b"same", b"short"));
+    }
+
+    #[test]
+    fn omitted_graph_scope_filters_include_all_evidence() {
+        let graph: crate::model::GraphQuery = serde_json::from_value(json!({})).unwrap();
+        let neighborhood: NeighborhoodQuery = serde_json::from_value(json!({})).unwrap();
+
+        assert!(!graph.in_scope_only);
+        assert!(!neighborhood.in_scope_only);
     }
 
     #[tokio::test]
@@ -1134,6 +1158,7 @@ mod tests {
         let second_body: Value = serde_json::from_slice(&second_body).unwrap();
         assert_eq!(first_body["proxy"]["url"], second_body["proxy"]["url"]);
         assert_eq!(first_body["proxy"]["upstreamTlsMode"], "insecure");
+        assert_eq!(first_body["proxyState"], "running");
 
         let delete = call(
             &app,
@@ -1146,12 +1171,12 @@ mod tests {
         assert_eq!(delete.status(), StatusCode::BAD_REQUEST);
 
         let stop_path = format!("/v1/sessions/{}/proxy/stop", session.id);
-        assert_eq!(
-            call(&app, "POST", &stop_path, "master-token", None)
-                .await
-                .status(),
-            StatusCode::OK
-        );
+        let stopped = call(&app, "POST", &stop_path, "master-token", None).await;
+        assert_eq!(stopped.status(), StatusCode::OK);
+        let stopped = to_bytes(stopped.into_body(), 16 * 1024).await.unwrap();
+        let stopped: Value = serde_json::from_slice(&stopped).unwrap();
+        assert_eq!(stopped["proxy"], Value::Null);
+        assert_eq!(stopped["proxyState"], "stopped");
         let resumed = call(&app, "POST", &start_path, "master-token", None).await;
         assert_eq!(resumed.status(), StatusCode::OK);
         let resumed = to_bytes(resumed.into_body(), 16 * 1024).await.unwrap();

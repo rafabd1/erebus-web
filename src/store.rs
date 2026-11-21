@@ -687,8 +687,15 @@ impl Store {
         let limit = query.limit.unwrap_or(50).clamp(1, 200) as usize;
         let mut sql = String::from(
             "SELECT we.id, we.connection_id, we.captured_at, we.kind, we.direction,
-                    we.opcode, wc.url, wc.subprotocol, wc.state, wc.close_code,
-                    wc.close_reason, wc.scope_state, we.payload_size,
+                    we.opcode, wc.url, wc.subprotocol,
+                    CASE we.kind
+                        WHEN 'close' THEN 'close'
+                        WHEN 'error' THEN 'error'
+                        ELSE 'open'
+                    END,
+                    CASE WHEN we.kind = 'close' THEN wc.close_code ELSE NULL END,
+                    CASE WHEN we.kind = 'close' THEN wc.close_reason ELSE NULL END,
+                    wc.scope_state, we.payload_size,
                     we.payload_original_size, we.error
              FROM websocket_events we
              JOIN websocket_connections wc ON wc.id = we.connection_id
@@ -798,8 +805,15 @@ impl Store {
         let row = connection
             .query_row(
                 "SELECT we.id, we.connection_id, we.captured_at, we.kind, we.direction,
-                        we.opcode, wc.url, wc.subprotocol, wc.state, wc.close_code,
-                        wc.close_reason, wc.scope_state, we.payload_size,
+                        we.opcode, wc.url, wc.subprotocol,
+                        CASE we.kind
+                            WHEN 'close' THEN 'close'
+                            WHEN 'error' THEN 'error'
+                            ELSE 'open'
+                        END,
+                        CASE WHEN we.kind = 'close' THEN wc.close_code ELSE NULL END,
+                        CASE WHEN we.kind = 'close' THEN wc.close_reason ELSE NULL END,
+                        wc.scope_state, we.payload_size,
                         we.payload_original_size, we.error, we.payload_hash,
                         we.payload_state, we.payload_reason,
                         CASE WHEN we.opcode = 1 THEN 'text/plain' ELSE NULL END
@@ -1166,6 +1180,10 @@ impl Store {
     }
 
     pub fn graph(&self, query: GraphQuery) -> anyhow::Result<GraphPage> {
+        // Cross the writer barrier before opening the read snapshot. This waits
+        // for an in-flight graph projection to commit without holding up the
+        // next capture while the map query runs.
+        drop(self.writer()?);
         let connection = self.reader()?;
         let limit = query.limit.unwrap_or(100).clamp(1, 500) as i64;
         let mut sql = String::from(
@@ -1228,6 +1246,8 @@ impl Store {
         scope: Option<ScopeState>,
         in_scope_only: bool,
     ) -> anyhow::Result<Option<GraphNeighborhood>> {
+        // Keep neighborhood reads on the same commit boundary as graph writes.
+        drop(self.writer()?);
         let connection = self.reader()?;
         let mut center_sql = String::from(
             "SELECT n.id, n.kind, n.canonical_key, n.label, n.metadata_json,
@@ -2602,6 +2622,26 @@ fn is_textual(mime: Option<&str>) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn graph_reads_wait_for_an_in_flight_writer() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(Store::open(temp.path()).unwrap());
+        let writer = store.writer().unwrap();
+        let query_store = store.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let query = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            query_store.graph(GraphQuery::default()).unwrap()
+        });
+
+        started_rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        assert!(!query.is_finished());
+
+        drop(writer);
+        assert!(query.join().unwrap().nodes.is_empty());
+    }
+
     fn request(url: &str) -> CapturedRequest {
         CapturedRequest {
             method: "GET".into(),
@@ -3397,8 +3437,9 @@ mod tests {
         assert_eq!(page.items.len(), 1);
         let summary = &page.items[0];
         assert_eq!(summary.url.as_deref(), Some("wss://example.com/socket"));
-        assert_eq!(summary.connection_state, "close");
-        assert_eq!(summary.close_code, Some(1000));
+        assert_eq!(summary.connection_state, "open");
+        assert_eq!(summary.close_code, None);
+        assert_eq!(summary.close_reason, None);
         assert_eq!(summary.scope, "in_scope");
         let detail = store.websocket_event(&summary.id).unwrap().unwrap();
         assert_eq!(
@@ -3408,6 +3449,36 @@ mod tests {
                 .as_deref(),
             Some("hello websocket")
         );
+
+        let history = store
+            .websocket_events(WebSocketQuery {
+                connection_id: Some(summary.connection_id.clone()),
+                ..WebSocketQuery::default()
+            })
+            .unwrap();
+        assert_eq!(history.items.len(), 3);
+        let open = history
+            .items
+            .iter()
+            .find(|event| event.kind == "open")
+            .unwrap();
+        let frame = history
+            .items
+            .iter()
+            .find(|event| event.kind == "frame")
+            .unwrap();
+        let close = history
+            .items
+            .iter()
+            .find(|event| event.kind == "close")
+            .unwrap();
+        assert_eq!(open.connection_state, "open");
+        assert_eq!(frame.connection_state, "open");
+        assert_eq!(close.connection_state, "close");
+        assert_eq!(open.close_code, None);
+        assert_eq!(frame.close_code, None);
+        assert_eq!(close.close_code, Some(1000));
+        assert_eq!(close.close_reason.as_deref(), Some("done"));
     }
 
     #[test]

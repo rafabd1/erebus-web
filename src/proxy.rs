@@ -1264,6 +1264,10 @@ where
                 if let Some(trailers) = frame.trailers_ref() {
                     this.tap.trailers(trailers);
                 }
+                if this.inner.as_ref().is_end_stream() && !*this.finished {
+                    this.tap.finish();
+                    *this.finished = true;
+                }
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(error))) => {
@@ -1629,6 +1633,9 @@ mod tests {
         assert_eq!(exchange.request.method, "GET");
         assert_eq!(exchange.response.as_ref().unwrap().status, 200);
         let response_body = exchange.response.unwrap().body.unwrap();
+        assert_eq!(response_body.state, BodyState::Complete);
+        assert_eq!(response_body.reason, None);
+        assert_eq!(response_body.original_size, Some(5));
         assert_eq!(
             base64::engine::general_purpose::STANDARD
                 .decode(response_body.data)

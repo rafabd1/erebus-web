@@ -361,12 +361,8 @@ pub struct GraphQuery {
     pub text: Option<String>,
     pub limit: Option<u32>,
     pub scope: Option<ScopeState>,
-    #[serde(default = "default_in_scope")]
+    #[serde(default)]
     pub in_scope_only: bool,
-}
-
-fn default_in_scope() -> bool {
-    true
 }
 
 #[derive(Clone, Debug, Serialize)]
