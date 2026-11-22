@@ -112,18 +112,22 @@ enum PairingResolution {
 
 impl PairingTokens {
     fn new(store: Arc<Store>) -> Self {
-        let (active, revoked) = match store.extension_pairings() {
+        let pairings = match store.extension_pairings() {
             Ok(pairings) => pairings,
             Err(error) => {
                 tracing::warn!(%error, "could not restore extension pairings");
-                (Vec::new(), Vec::new())
+                crate::store::ExtensionPairings {
+                    active: Vec::new(),
+                    revoked: Vec::new(),
+                }
             }
         };
         Self {
             store,
             state: Arc::new(Mutex::new(PairingTokenState {
-                active: active.into_iter().collect(),
-                revoked: revoked
+                active: pairings.active.into_iter().collect(),
+                revoked: pairings
+                    .revoked
                     .into_iter()
                     .rev()
                     .take(MAX_REVOKED_PAIRINGS)
