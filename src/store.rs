@@ -229,6 +229,90 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn extension_pairings(&self) -> anyhow::Result<(Vec<(String, String)>, Vec<String>)> {
+        let connection = self.reader()?;
+        let mut statement = connection.prepare(
+            "SELECT pairing.token_hash, pairing.session_id,
+                    CASE
+                        WHEN pairing.revoked = 1
+                          OR session.id IS NULL
+                          OR session.ended_at IS NOT NULL
+                        THEN 1 ELSE 0
+                    END AS is_revoked
+             FROM extension_pairings AS pairing
+             LEFT JOIN capture_sessions AS session ON session.id = pairing.session_id
+             ORDER BY pairing.created_at ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
+        })?;
+        let mut active = Vec::new();
+        let mut revoked = Vec::new();
+        for row in rows {
+            let (token_hash, session_id, is_revoked) = row?;
+            if is_revoked {
+                revoked.push(token_hash);
+            } else {
+                active.push((token_hash, session_id));
+            }
+        }
+        Ok((active, revoked))
+    }
+
+    pub fn replace_extension_pairing(
+        &self,
+        session_id: &str,
+        token_hash: &str,
+    ) -> anyhow::Result<()> {
+        let mut connection = self.writer()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM extension_pairings WHERE session_id = ?1",
+            [session_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO extension_pairings(token_hash, session_id, revoked, created_at)
+             VALUES (?1, ?2, 0, ?3)",
+            params![token_hash, session_id, now()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn revoke_extension_pairing(
+        &self,
+        session_id: &str,
+        max_revoked: usize,
+    ) -> anyhow::Result<()> {
+        let mut connection = self.writer()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "UPDATE extension_pairings
+             SET revoked = 1, revoked_at = COALESCE(revoked_at, ?2)
+             WHERE session_id = ?1 AND revoked = 0",
+            params![session_id, now()],
+        )?;
+        transaction.execute(
+            "DELETE FROM extension_pairings
+             WHERE revoked = 1
+               AND token_hash NOT IN (
+                   SELECT token_hash FROM extension_pairings
+                   WHERE revoked = 1
+                   ORDER BY revoked_at DESC, created_at DESC
+                   LIMIT ?1
+               )",
+            [i64::try_from(max_revoked)?],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn end_session(&self, id: &str) -> anyhow::Result<Option<CaptureSession>> {
         let connection = self.writer()?;
         let ended_at = now();
