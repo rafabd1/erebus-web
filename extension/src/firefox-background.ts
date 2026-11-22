@@ -8,12 +8,15 @@ import type {
   RuntimeConfig,
   TabCaptureState
 } from "./protocol";
+import { configFromBootstrap, discoverErebus } from "./bootstrap";
 
 const browserApi = (globalThis as typeof globalThis & { browser?: any }).browser;
 const CONFIG_KEY = "runtimeConfig";
 const TABS_KEY = "captureTabs";
+const INSTALL_ID_KEY = "installId";
 const AUTOMATION_POLL_MS = 20_000;
 const AUTOMATION_RETRY_MS = 1_500;
+const AUTOMATIC_PAIRING_RETRY_MS = 5_000;
 const PRESET_VIEWPORTS: Record<string, { width: number; height: number }> = {
   "iphone-se": { width: 375, height: 667 },
   "iphone-14-pro-max": { width: 430, height: 932 },
@@ -29,6 +32,7 @@ let tabStates = new Map<number, TabCaptureState>();
 let automationConnected = false;
 let automationGeneration = 0;
 let automationController: AbortController | undefined;
+let automaticPairingAttemptAt = 0;
 
 void initialize();
 browserApi.runtime.onStartup.addListener(() => void initialize());
@@ -71,6 +75,7 @@ async function initialize(): Promise<void> {
   const saved = await browserApi.storage.local.get([TABS_KEY]);
   const tabs = Array.isArray(saved[TABS_KEY]) ? (saved[TABS_KEY] as TabCaptureState[]) : [];
   tabStates = new Map(tabs.map((state) => [state.tabId, state]));
+  await ensureAutomaticPairing();
   for (const state of tabs) {
     await setIndicator(state.tabId, state.status === "error" ? "!" : "LIVE");
   }
@@ -126,6 +131,11 @@ async function handlePopupMessage(message: PopupRequest): Promise<PopupResponse>
       case "stopCurrentTab": {
         const tab = await activeTab();
         if (typeof tab.id === "number") await releaseTab(tab.id);
+        return { ok: true, state: currentState(await loadConfig()) };
+      }
+      case "reconnect": {
+        await ensureAutomaticPairing(true);
+        restartAutomationLoop();
         return { ok: true, state: currentState(await loadConfig()) };
       }
       case "flushNow":
@@ -247,6 +257,7 @@ async function ensureAutomationLoop(): Promise<void> {
       } catch {
         if (controller.signal.aborted || automationGeneration !== generation) return;
         automationConnected = false;
+        await ensureAutomaticPairing(true).catch(() => undefined);
         await delay(AUTOMATION_RETRY_MS);
       }
     }
@@ -259,10 +270,8 @@ async function ensureAutomationLoop(): Promise<void> {
 }
 
 async function automationTabs(): Promise<ExtensionAutomationTab[]> {
-  const tabs = await Promise.all(
-    [...tabStates.keys()].map((tabId) => browserApi.tabs.get(tabId).catch(() => undefined))
-  );
-  return tabs.flatMap((tab) =>
+  const tabs = await browserApi.tabs.query({});
+  return tabs.flatMap((tab: any) =>
     !tab || typeof tab.id !== "number" || typeof tab.windowId !== "number"
       ? []
       : [
@@ -270,13 +279,42 @@ async function automationTabs(): Promise<ExtensionAutomationTab[]> {
             tabId: tab.id,
             windowId: tab.windowId,
             active: tab.active === true,
-            attached: true,
+            attached:
+              tabStates.get(tab.id)?.status === "capturing" ||
+              tabStates.get(tab.id)?.status === "attaching",
             ...(tab.title ? { title: tab.title } : {}),
             ...(tab.url ? { url: tab.url } : {}),
             ...(tab.status ? { status: tab.status } : {})
           }
         ]
   );
+}
+
+async function ensureAutomaticPairing(force = false): Promise<RuntimeConfig | undefined> {
+  const previous = await loadConfig();
+  if (previous && !force) return previous;
+  const now = Date.now();
+  if (now - automaticPairingAttemptAt < AUTOMATIC_PAIRING_RETRY_MS) return previous;
+  automaticPairingAttemptAt = now;
+  const installId = await loadOrCreateInstallId();
+  const record = await discoverErebus(
+    installId,
+    "firefox",
+    browserApi.runtime.getManifest().version
+  );
+  if (!record) return previous;
+  const next = configFromBootstrap(record, installId, previous);
+  await browserApi.storage.local.set({ [CONFIG_KEY]: next });
+  return next;
+}
+
+async function loadOrCreateInstallId(): Promise<string> {
+  const saved = await browserApi.storage.local.get([INSTALL_ID_KEY]);
+  const existing = saved[INSTALL_ID_KEY];
+  if (typeof existing === "string" && existing.length >= 8) return existing;
+  const installId = crypto.randomUUID();
+  await browserApi.storage.local.set({ [INSTALL_ID_KEY]: installId });
+  return installId;
 }
 
 async function executeAutomation(command: ExtensionAutomationCommand): Promise<ExtensionAutomationResult> {
