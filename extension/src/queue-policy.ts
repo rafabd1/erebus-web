@@ -25,7 +25,8 @@ export function deliveryPath(kind: QueueKind): string {
 
 export function reboundConfig(
   current: RuntimeConfig | undefined,
-  proposed: Pick<RuntimeConfig, "serverUrl" | "token" | "sessionId">,
+  proposed: Pick<RuntimeConfig, "serverUrl" | "token" | "sessionId"> &
+    Partial<Pick<RuntimeConfig, "proxyUrl" | "caPem">>,
   producerId: () => string
 ): RuntimeConfig {
   const sameSession = current?.sessionId === proposed.sessionId;

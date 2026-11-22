@@ -14,6 +14,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 
+use crate::automation::{
+    ExtensionAutomation, ExtensionAutomationClientView, ExtensionAutomationInvokeInput,
+    ExtensionAutomationResult, ExtensionAutomationResultInput, ExtensionHeartbeatInput,
+    ExtensionPollInput,
+};
 use crate::capture::{CaptureManager, CaptureProxyDescriptor};
 use crate::config::Config;
 use crate::error::AppError;
@@ -32,6 +37,7 @@ pub struct AppState {
     store: Arc<Store>,
     captures: CaptureManager,
     pairings: PairingTokens,
+    automation: ExtensionAutomation,
     blocking_slots: Arc<Semaphore>,
     shutdown: CancellationToken,
 }
@@ -44,6 +50,7 @@ impl AppState {
             store,
             captures,
             pairings: PairingTokens::default(),
+            automation: ExtensionAutomation::default(),
             blocking_slots: Arc::new(Semaphore::new(MAX_BLOCKING_TASKS)),
             shutdown: CancellationToken::new(),
         }
@@ -171,6 +178,14 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{id}/proxy/start", post(start_session_proxy))
         .route("/sessions/{id}/proxy/stop", post(stop_session_proxy))
         .route("/sessions/{id}/pairing", post(create_pairing))
+        .route("/extension/clients", get(list_extension_clients))
+        .route("/extension/commands", post(invoke_extension_command))
+        .route("/extension/heartbeat", post(extension_heartbeat))
+        .route("/extension/commands/poll", post(poll_extension_command))
+        .route(
+            "/extension/commands/result",
+            post(complete_extension_command),
+        )
         .route("/shutdown", post(request_shutdown))
         .route("/proxy/ca", get(proxy_ca))
         .route("/scope", get(list_scope).post(save_scope))
@@ -221,7 +236,7 @@ async fn authorize(
         .ok_or(AppError::Unauthorized)?;
     let authorization = if constant_time_eq(token.as_bytes(), state.config.token().as_bytes()) {
         RuntimeAuthorization::Master
-    } else if pairing_capture_path(request.method(), request.uri().path()) {
+    } else if pairing_extension_path(request.method(), request.uri().path()) {
         match state.pairings.resolve(token).await {
             PairingResolution::Active(session_id) => RuntimeAuthorization::Pairing(session_id),
             PairingResolution::Revoked => return Err(AppError::Gone),
@@ -234,13 +249,18 @@ async fn authorize(
     Ok(next.run(request).await)
 }
 
-fn pairing_capture_path(method: &Method, path: &str) -> bool {
+fn pairing_extension_path(method: &Method, path: &str) -> bool {
     if *method != Method::POST {
         return false;
     }
     matches!(
         path.strip_prefix("/v1").unwrap_or(path),
-        "/ingest/http" | "/ingest/ws" | "/gaps"
+        "/ingest/http"
+            | "/ingest/ws"
+            | "/gaps"
+            | "/extension/heartbeat"
+            | "/extension/commands/poll"
+            | "/extension/commands/result"
     )
 }
 
@@ -476,6 +496,47 @@ async fn create_pairing(
     }))
 }
 
+async fn list_extension_clients(
+    State(state): State<AppState>,
+) -> Json<Vec<ExtensionAutomationClientView>> {
+    Json(state.automation.clients().await)
+}
+
+async fn invoke_extension_command(
+    State(state): State<AppState>,
+    Json(input): Json<ExtensionAutomationInvokeInput>,
+) -> Result<Json<ExtensionAutomationResult>, AppError> {
+    state.automation.invoke(input).await.map(Json)
+}
+
+async fn extension_heartbeat(
+    State(state): State<AppState>,
+    Extension(authorization): Extension<RuntimeAuthorization>,
+    Json(input): Json<ExtensionHeartbeatInput>,
+) -> Result<Json<ExtensionAutomationClientView>, AppError> {
+    authorization.require_session(&input.session_id)?;
+    Ok(Json(state.automation.heartbeat(input).await))
+}
+
+async fn poll_extension_command(
+    State(state): State<AppState>,
+    Extension(authorization): Extension<RuntimeAuthorization>,
+    Json(input): Json<ExtensionPollInput>,
+) -> Result<Json<Option<crate::automation::ExtensionAutomationCommand>>, AppError> {
+    authorization.require_session(&input.session_id)?;
+    state.automation.poll(&input).await.map(Json)
+}
+
+async fn complete_extension_command(
+    State(state): State<AppState>,
+    Extension(authorization): Extension<RuntimeAuthorization>,
+    Json(input): Json<ExtensionAutomationResultInput>,
+) -> Result<StatusCode, AppError> {
+    authorization.require_session(&input.session_id)?;
+    state.automation.complete(input).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn end_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -492,6 +553,7 @@ async fn end_session(
         .upstream_tls_mode(&id)
         .unwrap_or_else(|_| "verify".into());
     state.pairings.revoke_session(&id).await;
+    state.automation.disconnect_session(&id).await;
     if let Err(error) = state.captures.forget_upstream_tls(&id) {
         tracing::warn!(session_id = %id, %error, "could not remove ended session TLS settings");
     }
@@ -518,6 +580,7 @@ async fn delete_session(
         .await?
         .ok_or(AppError::NotFound)?;
     state.pairings.revoke_session(&id).await;
+    state.automation.disconnect_session(&id).await;
     if let Err(error) = state.captures.forget_upstream_tls(&id) {
         tracing::warn!(session_id = %id, %error, "could not remove deleted session TLS settings");
     }

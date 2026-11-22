@@ -1,6 +1,6 @@
 # Erebus Web Capture extension
 
-The extension captures only tabs selected by the user. It attaches through the Chrome DevTools Protocol, keeps unsent events in IndexedDB, and sends idempotent HTTP and WebSocket batches to the local Erebus web runtime.
+The extension controls and captures tabs selected by the user. Chromium uses the Chrome DevTools Protocol. Firefox uses its extension APIs. Both keep unsent events in IndexedDB and send idempotent HTTP and WebSocket batches to the local Erebus web runtime.
 
 ## Development
 
@@ -11,7 +11,7 @@ pnpm test
 pnpm build
 ```
 
-Load `dist/` as an unpacked extension in Chrome or Edge. Start the Erebus web runtime, create a capture session, then enter its local URL, token, and session ID in the popup.
+The build creates `dist/erebus-chromium-extension.zip` and `dist/erebus-firefox-extension.xpi`. Extract the Chromium ZIP before using **Load unpacked**. Firefox can load the XPI or `dist/firefox/manifest.json` temporarily. Start an extension capture in Erebus, then import its pairing record in the popup.
 
 Opening DevTools on a captured tab may take ownership of the debugger connection. The extension records the resulting gap and shows `detached`; press **Start capture** again after closing DevTools.
 
