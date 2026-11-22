@@ -51,6 +51,11 @@ pub struct Store {
     fts_enabled: bool,
 }
 
+pub struct ExtensionPairings {
+    pub active: Vec<(String, String)>,
+    pub revoked: Vec<String>,
+}
+
 #[derive(Debug)]
 struct DecodedBody {
     bytes: Option<Vec<u8>>,
@@ -229,7 +234,7 @@ impl Store {
             .map_err(Into::into)
     }
 
-    pub fn extension_pairings(&self) -> anyhow::Result<(Vec<(String, String)>, Vec<String>)> {
+    pub fn extension_pairings(&self) -> anyhow::Result<ExtensionPairings> {
         let connection = self.reader()?;
         let mut statement = connection.prepare(
             "SELECT pairing.token_hash, pairing.session_id,
@@ -260,7 +265,7 @@ impl Store {
                 active.push((token_hash, session_id));
             }
         }
-        Ok((active, revoked))
+        Ok(ExtensionPairings { active, revoked })
     }
 
     pub fn replace_extension_pairing(
