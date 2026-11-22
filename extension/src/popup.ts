@@ -13,6 +13,7 @@ const failed = element("failed");
 const error = element("error");
 const pairingLock = element("pairing-lock");
 let latestState: ExtensionState | undefined;
+let pairingExtras: { proxyUrl?: string; caPem?: string } = {};
 const buttons = {
   importPairing: button("import-pairing"),
   save: button("save"),
@@ -29,6 +30,10 @@ buttons.importPairing.addEventListener("click", () => {
     serverUrl.value = record.serverUrl;
     token.value = record.token;
     sessionId.value = record.sessionId;
+    pairingExtras = {
+      ...(record.proxyUrl ? { proxyUrl: record.proxyUrl } : {}),
+      ...(record.caPem ? { caPem: record.caPem } : {})
+    };
     void run({ type: "saveConfig", ...record });
   } catch (cause) {
     showError(message(cause));
@@ -40,7 +45,8 @@ buttons.save.addEventListener("click", () =>
     type: "saveConfig",
     serverUrl: serverUrl.value,
     token: token.value,
-    sessionId: sessionId.value
+    sessionId: sessionId.value,
+    ...pairingExtras
   })
 );
 buttons.start.addEventListener("click", () => run({ type: "startCurrentTab" }));
@@ -63,6 +69,10 @@ async function load(): Promise<void> {
       serverUrl.value = response.config.serverUrl;
       token.value = response.config.token;
       sessionId.value = response.config.sessionId;
+      pairingExtras = {
+        ...(response.config.proxyUrl ? { proxyUrl: response.config.proxyUrl } : {}),
+        ...(response.config.caPem ? { caPem: response.config.caPem } : {})
+      };
     }
     render(response.state);
   } catch (cause) {
@@ -88,7 +98,11 @@ async function run(request: PopupRequest): Promise<void> {
 
 function render(state: ExtensionState): void {
   latestState = state;
-  connection.textContent = state.configured ? "Paired" : "Not paired";
+  connection.textContent = state.configured
+    ? state.automationConnected
+      ? "Paired · agent online"
+      : "Paired · waiting"
+    : "Not paired";
   connection.classList.toggle("connected", state.configured);
   queued.textContent = String(state.queued);
   failed.textContent = String(state.deadLetters);

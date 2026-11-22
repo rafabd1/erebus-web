@@ -103,6 +103,8 @@ export interface RuntimeConfig {
   sessionId: string;
   producerId: string;
   nextSequence: number;
+  proxyUrl?: string;
+  caPem?: string;
 }
 
 export interface CaptureGap {
@@ -127,12 +129,52 @@ export interface ExtensionState {
   queued: number;
   deadLetters: number;
   pairingLocked: boolean;
+  automationConnected: boolean;
   lastFlushError?: string;
+}
+
+export interface ExtensionAutomationTab {
+  tabId: number;
+  windowId: number;
+  active: boolean;
+  attached: boolean;
+  title?: string;
+  url?: string;
+  status?: string;
+}
+
+export interface ExtensionAutomationCommand {
+  id: string;
+  tabId?: number;
+  operation: string;
+  input: Record<string, unknown>;
+  timeoutMs: number;
+  createdAtMs: number;
+}
+
+export interface ExtensionAutomationError {
+  tag: string;
+  message: string;
+  detail?: unknown;
+}
+
+export interface ExtensionAutomationResult {
+  commandId: string;
+  ok: boolean;
+  result?: unknown;
+  error?: ExtensionAutomationError;
 }
 
 export type PopupRequest =
   | { type: "getState" }
-  | { type: "saveConfig"; serverUrl: string; token: string; sessionId: string }
+  | {
+      type: "saveConfig";
+      serverUrl: string;
+      token: string;
+      sessionId: string;
+      proxyUrl?: string;
+      caPem?: string;
+    }
   | { type: "startCurrentTab" }
   | { type: "stopCurrentTab" }
   | { type: "flushNow" }

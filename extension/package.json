@@ -1,6 +1,6 @@
 {
   "name": "@erebus/web-capture-extension",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -12,6 +12,7 @@
     "@types/chrome": "^0.1.31",
     "esbuild": "^0.27.0",
     "fake-indexeddb": "^6.2.8",
+    "jszip": "3.10.1",
     "typescript": "^5.9.3",
     "vitest": "^4.0.13"
   }

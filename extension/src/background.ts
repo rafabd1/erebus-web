@@ -1,10 +1,13 @@
 import { bodyFromCdp, normalizeHeaders, unavailableBody } from "./normalization";
 import { applyExtraInfo } from "./extra-info";
+import { executeChromiumAutomationCommand } from "./automation";
 import type {
   CapturedBody,
   CapturedResponse,
   CaptureGapEvent,
   ExtensionState,
+  ExtensionAutomationCommand,
+  ExtensionAutomationResult,
   HttpCaptureEvent,
   IngestResult,
   PopupRequest,
@@ -53,6 +56,8 @@ const MAX_QUEUE_BYTES = 256 * 1024 * 1024;
 const MAX_DEAD_LETTERS = 200;
 const MAX_GAPS_PER_TAB = 20;
 const EXTRA_INFO_GRACE_MS = 35;
+const AUTOMATION_POLL_MS = 20_000;
+const AUTOMATION_RETRY_MS = 1_500;
 
 interface PendingRequest {
   requestId: string;
@@ -101,13 +106,19 @@ let queuedBytesEstimate = 0;
 let queueUsageReady = false;
 let flushRequested = false;
 let activeDeliveryController: AbortController | undefined;
+let automationConnected = false;
+let automationGeneration = 0;
+let automationController: AbortController | undefined;
 
 void initialize();
 
 chrome.runtime.onInstalled.addListener(() => void initialize());
 chrome.runtime.onStartup.addListener(() => void initialize());
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === FLUSH_ALARM || alarm.name === FLUSH_SOON_ALARM) void flushAll();
+  if (alarm.name === FLUSH_ALARM || alarm.name === FLUSH_SOON_ALARM) {
+    void flushAll();
+    void ensureAutomationLoop();
+  }
 });
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
@@ -153,6 +164,7 @@ async function initialize(): Promise<void> {
     }
   }
   await flushAll();
+  void ensureAutomationLoop();
 }
 
 async function handlePopupMessage(message: PopupRequest): Promise<PopupResponse> {
@@ -168,7 +180,9 @@ async function handlePopupMessage(message: PopupRequest): Promise<PopupResponse>
                 serverUrl: config.serverUrl,
                 token: config.token,
                 sessionId: config.sessionId,
-                producerId: config.producerId
+                producerId: config.producerId,
+                ...(config.proxyUrl ? { proxyUrl: config.proxyUrl } : {}),
+                ...(config.caPem ? { caPem: config.caPem } : {})
               }
             }
           : {})
@@ -179,6 +193,8 @@ async function handlePopupMessage(message: PopupRequest): Promise<PopupResponse>
       const serverUrl = normalizeServerUrl(message.serverUrl);
       const token = message.token.trim();
       const sessionId = message.sessionId.trim();
+      const proxyUrl = message.proxyUrl?.trim() || undefined;
+      const caPem = message.caPem?.trim() || undefined;
       if (!token || !sessionId) throw new Error("token and capture session are required");
       const counts = await queueCounts();
       const locked = counts.queued > 0 || hasActiveCapture();
@@ -194,13 +210,18 @@ async function handlePopupMessage(message: PopupRequest): Promise<PopupResponse>
           throw new Error(pairingError);
         }
         return {
-          config: reboundConfig(latest, { serverUrl, token, sessionId }, () => crypto.randomUUID()),
+          config: reboundConfig(
+            latest,
+            { serverUrl, token, sessionId, ...(proxyUrl ? { proxyUrl } : {}), ...(caPem ? { caPem } : {}) },
+            () => crypto.randomUUID()
+          ),
           result: latest
         };
       });
       if (previous && (previous.serverUrl !== serverUrl || previous.token !== token)) {
         activeDeliveryController?.abort();
       }
+      restartAutomationLoop();
       await saveLastFlushError();
       await flushAll();
       return { ok: true, state: await currentState() };
@@ -235,7 +256,9 @@ async function attachTab(tabId: number, restoring: boolean): Promise<void> {
   const config = await requireConfig();
   void config;
   const tab = await chrome.tabs.get(tabId);
-  if (!tab.url || !/^https?:/i.test(tab.url)) throw new Error("select an HTTP or HTTPS tab");
+  if (!tab.url || (!/^https?:/i.test(tab.url) && tab.url !== "about:blank")) {
+    throw new Error("select an HTTP, HTTPS, or blank tab");
+  }
 
   const previous = tabStates.get(tabId);
   tabStates.set(tabId, {
@@ -268,6 +291,9 @@ async function attachTab(tabId: number, restoring: boolean): Promise<void> {
   await persistTabs();
   await chrome.action.setBadgeBackgroundColor({ tabId, color: "#1f8f5f" });
   await chrome.action.setBadgeText({ tabId, text: "REC" });
+  await chrome.action
+    .setTitle({ tabId, title: "Erebus is controlling and capturing this tab" })
+    .catch(() => undefined);
 }
 
 async function stopTab(tabId: number): Promise<void> {
@@ -295,6 +321,7 @@ async function stopTab(tabId: number): Promise<void> {
     // The tab may already be closed or detached by DevTools.
   }
   await chrome.action.setBadgeText({ tabId, text: "" }).catch(() => undefined);
+  await chrome.action.setTitle({ tabId, title: "Erebus Web Capture" }).catch(() => undefined);
 }
 
 async function handleDebuggerEvent(
@@ -841,8 +868,150 @@ async function currentState(): Promise<ExtensionState> {
     tabs: [...tabStates.values()].sort((a, b) => a.tabId - b.tabId),
     ...counts,
     pairingLocked: counts.queued > 0 || hasActiveCapture(),
+    automationConnected,
     ...(lastFlushError ? { lastFlushError } : {})
   };
+}
+
+async function ensureAutomationLoop(): Promise<void> {
+  if (automationController) return;
+  const generation = ++automationGeneration;
+  const controller = new AbortController();
+  automationController = controller;
+  try {
+    await runAutomationLoop(generation, controller.signal);
+  } finally {
+    if (automationGeneration === generation) {
+      automationController = undefined;
+      automationConnected = false;
+    }
+  }
+}
+
+function restartAutomationLoop(): void {
+  automationGeneration += 1;
+  automationConnected = false;
+  automationController?.abort();
+  automationController = undefined;
+  void ensureAutomationLoop();
+}
+
+async function runAutomationLoop(generation: number, signal: AbortSignal): Promise<void> {
+  while (!signal.aborted && automationGeneration === generation) {
+    const config = await loadConfig();
+    if (!config) return;
+    try {
+      await pairingRequest(config, "/v1/extension/heartbeat", {
+        sessionId: config.sessionId,
+        producerId: config.producerId,
+        browser: "chromium",
+        version: chrome.runtime.getManifest().version,
+        tabs: await automationTabs()
+      }, signal);
+      automationConnected = true;
+      const command = await pairingRequest<ExtensionAutomationCommand | null>(
+        config,
+        "/v1/extension/commands/poll",
+        {
+          sessionId: config.sessionId,
+          producerId: config.producerId,
+          waitMs: AUTOMATION_POLL_MS
+        },
+        signal
+      );
+      if (!command) continue;
+      const result = await executeChromiumAutomationCommand(command, chromiumAutomationApi);
+      await submitAutomationResult(config, result, signal);
+    } catch (error) {
+      if (signal.aborted || automationGeneration !== generation) return;
+      automationConnected = false;
+      await delay(AUTOMATION_RETRY_MS);
+    }
+  }
+}
+
+const chromiumAutomationApi = {
+  async attachedTabs(): Promise<chrome.tabs.Tab[]> {
+    const tabs = await Promise.all(
+      [...tabStates.values()]
+        .filter((state) => state.status === "capturing" || state.status === "attaching")
+        .map((state) => chrome.tabs.get(state.tabId).catch(() => undefined))
+    );
+    return tabs.filter((tab): tab is chrome.tabs.Tab => tab !== undefined);
+  },
+  async ensureAttached(tabId: number): Promise<void> {
+    const state = tabStates.get(tabId);
+    if (state?.status === "capturing") return;
+    await attachTab(tabId, false);
+  },
+  createTab(url?: string): Promise<chrome.tabs.Tab> {
+    return chrome.tabs.create({ url, active: true });
+  },
+  getTab(tabId: number): Promise<chrome.tabs.Tab> {
+    return chrome.tabs.get(tabId);
+  },
+  async updateTab(tabId: number, update: chrome.tabs.UpdateProperties): Promise<chrome.tabs.Tab> {
+    const tab = await chrome.tabs.update(tabId, update);
+    if (!tab) throw new Error("browser did not return the updated tab");
+    return tab;
+  },
+  async closeTab(tabId: number): Promise<void> {
+    await chrome.tabs.remove(tabId);
+  },
+  sendCommand
+};
+
+async function automationTabs(): Promise<import("./protocol").ExtensionAutomationTab[]> {
+  const tabs = await chromiumAutomationApi.attachedTabs();
+  return tabs.flatMap((tab) =>
+    tab.id === undefined || tab.windowId === undefined
+      ? []
+      : [{
+          tabId: tab.id,
+          windowId: tab.windowId,
+          active: tab.active,
+          attached: true,
+          ...(tab.title ? { title: tab.title } : {}),
+          ...(tab.url ? { url: tab.url } : {}),
+          ...(tab.status ? { status: tab.status } : {})
+        }]
+  );
+}
+
+async function submitAutomationResult(
+  config: RuntimeConfig,
+  result: ExtensionAutomationResult,
+  signal: AbortSignal
+): Promise<void> {
+  await pairingRequest(
+    config,
+    "/v1/extension/commands/result",
+    { sessionId: config.sessionId, producerId: config.producerId, ...result },
+    signal
+  );
+}
+
+async function pairingRequest<T = unknown>(
+  config: RuntimeConfig,
+  path: string,
+  body: unknown,
+  signal: AbortSignal
+): Promise<T> {
+  const response = await fetch(`${config.serverUrl}${path}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${config.token}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body),
+    signal
+  });
+  if (!response.ok) {
+    const detail = (await response.text()).trim();
+    throw new Error(detail || `Erebus runtime returned HTTP ${response.status}`);
+  }
+  if (response.status === 204) return undefined as T;
+  return (await response.json()) as T;
 }
 
 async function markUnexpectedDetach(tabId: number, reason: string): Promise<void> {

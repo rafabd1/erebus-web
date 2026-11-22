@@ -2,6 +2,8 @@ export interface PairingRecord {
   serverUrl: string;
   token: string;
   sessionId: string;
+  proxyUrl?: string;
+  caPem?: string;
 }
 
 export function parsePairingRecord(value: string): PairingRecord {
@@ -21,5 +23,13 @@ export function parsePairingRecord(value: string): PairingRecord {
   if (!serverUrl || !token || !sessionId) {
     throw new Error("Pairing record must include serverUrl, token, and sessionId.");
   }
-  return { serverUrl, token, sessionId };
+  const proxyUrl = typeof record.proxyUrl === "string" ? record.proxyUrl.trim() : "";
+  const caPem = typeof record.caPem === "string" ? record.caPem.trim() : "";
+  return {
+    serverUrl,
+    token,
+    sessionId,
+    ...(proxyUrl ? { proxyUrl } : {}),
+    ...(caPem ? { caPem } : {})
+  };
 }
