@@ -177,6 +177,7 @@ export type PopupRequest =
     }
   | { type: "startCurrentTab" }
   | { type: "stopCurrentTab" }
+  | { type: "reconnect" }
   | { type: "flushNow" }
   | { type: "discardQueue" };
 

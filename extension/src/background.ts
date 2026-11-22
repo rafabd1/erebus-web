@@ -1,6 +1,7 @@
 import { bodyFromCdp, normalizeHeaders, unavailableBody } from "./normalization";
 import { applyExtraInfo } from "./extra-info";
 import { executeChromiumAutomationCommand } from "./automation";
+import { configFromBootstrap, discoverErebus } from "./bootstrap";
 import type {
   CapturedBody,
   CapturedResponse,
@@ -37,6 +38,7 @@ import {
   enqueue,
   loadConfig,
   loadLastFlushError,
+  loadOrCreateInstallId,
   loadTabStates,
   pruneStorage,
   queueUsage,
@@ -58,6 +60,7 @@ const MAX_GAPS_PER_TAB = 20;
 const EXTRA_INFO_GRACE_MS = 35;
 const AUTOMATION_POLL_MS = 20_000;
 const AUTOMATION_RETRY_MS = 1_500;
+const AUTOMATIC_PAIRING_RETRY_MS = 5_000;
 
 interface PendingRequest {
   requestId: string;
@@ -109,6 +112,7 @@ let activeDeliveryController: AbortController | undefined;
 let automationConnected = false;
 let automationGeneration = 0;
 let automationController: AbortController | undefined;
+let automaticPairingAttemptAt = 0;
 
 void initialize();
 
@@ -117,7 +121,7 @@ chrome.runtime.onStartup.addListener(() => void initialize());
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === FLUSH_ALARM || alarm.name === FLUSH_SOON_ALARM) {
     void flushAll();
-    void ensureAutomationLoop();
+    void ensureAutomaticPairing().then(() => ensureAutomationLoop());
   }
 });
 
@@ -152,6 +156,7 @@ async function initialize(): Promise<void> {
   const [savedTabs] = await Promise.all([loadTabStates(), chrome.alarms.clear(FLUSH_ALARM)]);
   tabStates = new Map(savedTabs.map((state) => [state.tabId, state]));
   await refreshQueueUsage();
+  await ensureAutomaticPairing();
   await chrome.alarms.create(FLUSH_ALARM, { periodInMinutes: 0.5 });
   for (const state of savedTabs) {
     if (state.status === "capturing" || state.status === "attaching") {
@@ -234,6 +239,11 @@ async function handlePopupMessage(message: PopupRequest): Promise<PopupResponse>
     case "stopCurrentTab": {
       const tab = await activeTab();
       await stopTab(tab.id!);
+      return { ok: true, state: await currentState() };
+    }
+    case "reconnect": {
+      await ensureAutomaticPairing(true);
+      restartAutomationLoop();
       return { ok: true, state: await currentState() };
     }
     case "flushNow": {
@@ -925,6 +935,7 @@ async function runAutomationLoop(generation: number, signal: AbortSignal): Promi
     } catch (error) {
       if (signal.aborted || automationGeneration !== generation) return;
       automationConnected = false;
+      await ensureAutomaticPairing(true).catch(() => undefined);
       await delay(AUTOMATION_RETRY_MS);
     }
   }
@@ -932,12 +943,7 @@ async function runAutomationLoop(generation: number, signal: AbortSignal): Promi
 
 const chromiumAutomationApi = {
   async attachedTabs(): Promise<chrome.tabs.Tab[]> {
-    const tabs = await Promise.all(
-      [...tabStates.values()]
-        .filter((state) => state.status === "capturing" || state.status === "attaching")
-        .map((state) => chrome.tabs.get(state.tabId).catch(() => undefined))
-    );
-    return tabs.filter((tab): tab is chrome.tabs.Tab => tab !== undefined);
+    return chrome.tabs.query({});
   },
   async ensureAttached(tabId: number): Promise<void> {
     const state = tabStates.get(tabId);
@@ -970,12 +976,38 @@ async function automationTabs(): Promise<import("./protocol").ExtensionAutomatio
           tabId: tab.id,
           windowId: tab.windowId,
           active: tab.active,
-          attached: true,
+          attached:
+            tabStates.get(tab.id)?.status === "capturing" ||
+            tabStates.get(tab.id)?.status === "attaching",
           ...(tab.title ? { title: tab.title } : {}),
           ...(tab.url ? { url: tab.url } : {}),
           ...(tab.status ? { status: tab.status } : {})
         }]
   );
+}
+
+async function ensureAutomaticPairing(force = false): Promise<RuntimeConfig | undefined> {
+  const previous = await loadConfig();
+  if (previous && !force) return previous;
+  const now = Date.now();
+  if (now - automaticPairingAttemptAt < AUTOMATIC_PAIRING_RETRY_MS) return previous;
+  automaticPairingAttemptAt = now;
+  const installId = await loadOrCreateInstallId();
+  const record = await discoverErebus(
+    installId,
+    "chromium",
+    chrome.runtime.getManifest().version
+  );
+  if (!record) return previous;
+  const next = configFromBootstrap(record, installId, previous);
+  await saveConfig(next);
+  if (
+    previous &&
+    (previous.serverUrl !== next.serverUrl || previous.token !== next.token)
+  ) {
+    activeDeliveryController?.abort();
+  }
+  return next;
 }
 
 async function submitAutomationResult(
