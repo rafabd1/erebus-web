@@ -46,6 +46,16 @@ BEGIN
     SELECT RAISE(ABORT, 'active browser source already reserved');
 END;
 
+CREATE TABLE IF NOT EXISTS extension_pairings (
+    token_hash TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    revoked INTEGER NOT NULL DEFAULT 0 CHECK (revoked IN (0, 1)),
+    created_at TEXT NOT NULL,
+    revoked_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_extension_pairings_session
+ON extension_pairings(session_id, revoked);
+
 CREATE TABLE IF NOT EXISTS blobs (
     hash TEXT PRIMARY KEY,
     size INTEGER NOT NULL,

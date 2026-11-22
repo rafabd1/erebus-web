@@ -45,11 +45,12 @@ pub struct AppState {
 impl AppState {
     pub fn new(config: Config, store: Arc<Store>) -> Self {
         let captures = CaptureManager::new(store.clone(), &config.data_dir);
+        let pairings = PairingTokens::new(store.clone());
         Self {
             config,
             store,
             captures,
-            pairings: PairingTokens::default(),
+            pairings,
             automation: ExtensionAutomation::default(),
             blocking_slots: Arc::new(Semaphore::new(MAX_BLOCKING_TASKS)),
             shutdown: CancellationToken::new(),
@@ -91,8 +92,9 @@ impl AppState {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct PairingTokens {
+    store: Arc<Store>,
     state: Arc<Mutex<PairingTokenState>>,
 }
 
@@ -109,31 +111,71 @@ enum PairingResolution {
 }
 
 impl PairingTokens {
-    async fn issue(&self, session_id: &str) -> String {
+    fn new(store: Arc<Store>) -> Self {
+        let (active, revoked) = match store.extension_pairings() {
+            Ok(pairings) => pairings,
+            Err(error) => {
+                tracing::warn!(%error, "could not restore extension pairings");
+                (Vec::new(), Vec::new())
+            }
+        };
+        Self {
+            store,
+            state: Arc::new(Mutex::new(PairingTokenState {
+                active: active.into_iter().collect(),
+                revoked: revoked
+                    .into_iter()
+                    .rev()
+                    .take(MAX_REVOKED_PAIRINGS)
+                    .collect::<VecDeque<_>>(),
+            })),
+        }
+    }
+
+    async fn issue(&self, session_id: &str) -> Result<String, AppError> {
         let mut random = [0_u8; 32];
         rand::rng().fill_bytes(&mut random);
         let token = blake3::hash(&random).to_hex().to_string();
+        let token_hash = pairing_token_hash(&token);
+        let store = self.store.clone();
+        let persisted_session = session_id.to_owned();
+        let persisted_hash = token_hash.clone();
+        tokio::task::spawn_blocking(move || {
+            store.replace_extension_pairing(&persisted_session, &persisted_hash)
+        })
+        .await
+        .map_err(AppError::Join)?
+        .map_err(AppError::Storage)?;
         let mut state = self.state.lock().await;
         state
             .active
             .retain(|_, paired_session| paired_session != session_id);
-        state.revoked.retain(|revoked| revoked != &token);
-        state.active.insert(token.clone(), session_id.to_owned());
-        token
+        state.revoked.retain(|revoked| revoked != &token_hash);
+        state.active.insert(token_hash, session_id.to_owned());
+        Ok(token)
     }
 
     async fn resolve(&self, token: &str) -> PairingResolution {
+        let token_hash = pairing_token_hash(token);
         let state = self.state.lock().await;
-        if let Some(session_id) = state.active.get(token) {
+        if let Some(session_id) = state.active.get(&token_hash) {
             PairingResolution::Active(session_id.clone())
-        } else if state.revoked.iter().any(|revoked| revoked == token) {
+        } else if state.revoked.iter().any(|revoked| revoked == &token_hash) {
             PairingResolution::Revoked
         } else {
             PairingResolution::Unknown
         }
     }
 
-    async fn revoke_session(&self, session_id: &str) {
+    async fn revoke_session(&self, session_id: &str) -> Result<(), AppError> {
+        let store = self.store.clone();
+        let persisted_session = session_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            store.revoke_extension_pairing(&persisted_session, MAX_REVOKED_PAIRINGS)
+        })
+        .await
+        .map_err(AppError::Join)?
+        .map_err(AppError::Storage)?;
         let mut state = self.state.lock().await;
         let revoked = state
             .active
@@ -151,7 +193,12 @@ impl PairingTokens {
         while state.revoked.len() > MAX_REVOKED_PAIRINGS {
             state.revoked.pop_front();
         }
+        Ok(())
     }
+}
+
+fn pairing_token_hash(token: &str) -> String {
+    blake3::hash(token.as_bytes()).to_hex().to_string()
 }
 
 #[derive(Clone, Debug)]
@@ -492,7 +539,7 @@ async fn create_pairing(
         ));
     }
     Ok(Json(PairingToken {
-        token: state.pairings.issue(&id).await,
+        token: state.pairings.issue(&id).await?,
     }))
 }
 
@@ -552,7 +599,7 @@ async fn end_session(
         .captures
         .upstream_tls_mode(&id)
         .unwrap_or_else(|_| "verify".into());
-    state.pairings.revoke_session(&id).await;
+    state.pairings.revoke_session(&id).await?;
     state.automation.disconnect_session(&id).await;
     if let Err(error) = state.captures.forget_upstream_tls(&id) {
         tracing::warn!(session_id = %id, %error, "could not remove ended session TLS settings");
@@ -579,7 +626,7 @@ async fn delete_session(
         .run_blocking(move || store.delete_session(&session_id))
         .await?
         .ok_or(AppError::NotFound)?;
-    state.pairings.revoke_session(&id).await;
+    state.pairings.revoke_session(&id).await?;
     state.automation.disconnect_session(&id).await;
     if let Err(error) = state.captures.forget_upstream_tls(&id) {
         tracing::warn!(session_id = %id, %error, "could not remove deleted session TLS settings");
@@ -981,21 +1028,35 @@ mod tests {
 
     #[tokio::test]
     async fn pairing_replacement_stays_rebindable_and_revocation_is_terminal() {
-        let pairings = PairingTokens::default();
-        let first = pairings.issue("session").await;
-        let second = pairings.issue("session").await;
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(temp.path()).unwrap());
+        let session = store
+            .create_session(CreateSession {
+                label: "extension".into(),
+                source: "extension".into(),
+                scope_profile_id: None,
+            })
+            .unwrap();
+        let pairings = PairingTokens::new(store.clone());
+        let first = pairings.issue(&session.id).await.unwrap();
+        let second = pairings.issue(&session.id).await.unwrap();
         assert!(matches!(
             pairings.resolve(&first).await,
             PairingResolution::Unknown
         ));
         assert!(matches!(
             pairings.resolve(&second).await,
-            PairingResolution::Active(session) if session == "session"
+            PairingResolution::Active(resolved) if resolved == session.id
         ));
 
-        pairings.revoke_session("session").await;
+        let restored = PairingTokens::new(store);
         assert!(matches!(
-            pairings.resolve(&second).await,
+            restored.resolve(&second).await,
+            PairingResolution::Active(resolved) if resolved == session.id
+        ));
+        restored.revoke_session(&session.id).await.unwrap();
+        assert!(matches!(
+            restored.resolve(&second).await,
             PairingResolution::Revoked
         ));
     }
