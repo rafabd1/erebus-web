@@ -8,11 +8,6 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "esbuild"
-    ]
-  },
   "devDependencies": {
     "@types/chrome": "^0.1.31",
     "esbuild": "^0.27.0",
