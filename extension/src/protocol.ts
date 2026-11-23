@@ -107,6 +107,11 @@ export interface RuntimeConfig {
   caPem?: string;
 }
 
+/** A browser installation may be connected to more than one local Erebus workspace. */
+export interface RuntimeSettings {
+  configs: RuntimeConfig[];
+}
+
 export interface CaptureGap {
   at: string;
   reason: string;
@@ -121,6 +126,8 @@ export interface TabCaptureState {
   captured: number;
   gaps: CaptureGap[];
   startedAt: string;
+  /** Runtime and capture session that own this tab. */
+  target?: QueueTarget;
 }
 
 export interface ExtensionState {

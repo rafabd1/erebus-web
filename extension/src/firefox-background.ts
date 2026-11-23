@@ -5,15 +5,19 @@ import type {
   ExtensionState,
   PopupRequest,
   PopupResponse,
+  QueueTarget,
   RuntimeConfig,
+  RuntimeSettings,
   TabCaptureState
 } from "./protocol";
-import { configFromBootstrap, discoverErebus } from "./bootstrap";
+import { configFromBootstrap, discoverErebuses } from "./bootstrap";
+import { queueTarget, sameTarget } from "./queue-policy";
 
 const browserApi = (globalThis as typeof globalThis & { browser?: any }).browser;
 const CONFIG_KEY = "runtimeConfig";
 const TABS_KEY = "captureTabs";
 const INSTALL_ID_KEY = "installId";
+const PAIRING_ALARM = "erebus-web-pairing";
 const AUTOMATION_POLL_MS = 20_000;
 const AUTOMATION_RETRY_MS = 1_500;
 const AUTOMATIC_PAIRING_RETRY_MS = 5_000;
@@ -31,12 +35,19 @@ const PRESET_VIEWPORTS: Record<string, { width: number; height: number }> = {
 let tabStates = new Map<number, TabCaptureState>();
 let automationConnected = false;
 let automationGeneration = 0;
-let automationController: AbortController | undefined;
+const automationControllers = new Map<string, AbortController>();
 let automaticPairingAttemptAt = 0;
+let automaticPairingInFlight: Promise<RuntimeConfig | undefined> | undefined;
+const tabCommandChains = new Map<number, Promise<void>>();
 
 void initialize();
 browserApi.runtime.onStartup.addListener(() => void initialize());
 browserApi.runtime.onInstalled.addListener(() => void initialize());
+browserApi.alarms.onAlarm.addListener((alarm: { name: string }) => {
+  if (alarm.name === PAIRING_ALARM) {
+    void ensureAutomaticPairing().then(() => ensureAutomationLoop());
+  }
+});
 browserApi.tabs.onRemoved.addListener((tabId: number) => {
   if (!tabStates.delete(tabId)) return;
   void persistTabs();
@@ -57,7 +68,8 @@ browserApi.runtime.onMessage.addListener((message: PopupRequest) => handlePopupM
 browserApi.proxy.onRequest.addListener(
   async (details: { tabId?: number; url?: string }) => {
     if (details.tabId === undefined || !tabStates.has(details.tabId)) return { type: "direct" };
-    const config = await loadConfig();
+    const target = tabStates.get(details.tabId)?.target;
+    const config = target ? await configForTarget(target) : undefined;
     if (!config?.proxyUrl) return { type: "direct" };
     const proxy = parseProxy(config.proxyUrl);
     return {
@@ -76,6 +88,7 @@ async function initialize(): Promise<void> {
   const tabs = Array.isArray(saved[TABS_KEY]) ? (saved[TABS_KEY] as TabCaptureState[]) : [];
   tabStates = new Map(tabs.map((state) => [state.tabId, state]));
   await ensureAutomaticPairing();
+  await browserApi.alarms.create(PAIRING_ALARM, { periodInMinutes: 0.5 });
   for (const state of tabs) {
     await setIndicator(state.tabId, state.status === "error" ? "!" : "LIVE");
   }
@@ -86,7 +99,7 @@ async function handlePopupMessage(message: PopupRequest): Promise<PopupResponse>
   try {
     switch (message.type) {
       case "getState": {
-        const config = await loadConfig();
+        const config = (await loadConfigs())[0];
         return {
           ok: true,
           state: currentState(config),
@@ -94,16 +107,13 @@ async function handlePopupMessage(message: PopupRequest): Promise<PopupResponse>
         };
       }
       case "saveConfig": {
-        const previous = await loadConfig();
+        const previous = (await loadConfigs())[0];
         const serverUrl = normalizeServerUrl(message.serverUrl);
         const token = message.token.trim();
         const sessionId = message.sessionId.trim();
         const proxyUrl = message.proxyUrl?.trim();
         const caPem = message.caPem?.trim();
         if (!token || !sessionId) throw new Error("token and capture session are required");
-        if (tabStates.size > 0 && previous?.sessionId !== sessionId) {
-          throw new Error("stop controlled tabs before changing capture session");
-        }
         if (proxyUrl) parseProxy(proxyUrl);
         const sameSession = previous?.sessionId === sessionId;
         const next: RuntimeConfig = {
@@ -115,7 +125,8 @@ async function handlePopupMessage(message: PopupRequest): Promise<PopupResponse>
           ...(proxyUrl ? { proxyUrl } : {}),
           ...(caPem ? { caPem } : {})
         };
-        await browserApi.storage.local.set({ [CONFIG_KEY]: next });
+        const configs = await loadConfigs();
+        await saveConfigs([next, ...configs.filter((config) => !sameTarget(queueTarget(config), queueTarget(next)))]);
         restartAutomationLoop();
         return { ok: true, state: currentState(next) };
       }
@@ -125,28 +136,28 @@ async function handlePopupMessage(message: PopupRequest): Promise<PopupResponse>
           throw new Error("Firefox capture needs a proxy pairing record from an active Erebus session");
         }
         const tab = await activeTab();
-        await controlTab(tab);
+        await controlTab(tab, config);
         return { ok: true, state: currentState(config) };
       }
       case "stopCurrentTab": {
         const tab = await activeTab();
         if (typeof tab.id === "number") await releaseTab(tab.id);
-        return { ok: true, state: currentState(await loadConfig()) };
+        return { ok: true, state: currentState((await loadConfigs())[0]) };
       }
       case "reconnect": {
         await ensureAutomaticPairing(true);
         restartAutomationLoop();
-        return { ok: true, state: currentState(await loadConfig()) };
+        return { ok: true, state: currentState((await loadConfigs())[0]) };
       }
       case "flushNow":
       case "discardQueue":
-        return { ok: true, state: currentState(await loadConfig()) };
+        return { ok: true, state: currentState((await loadConfigs())[0]) };
     }
   } catch (cause) {
     return {
       ok: false,
       error: errorMessage(cause),
-      state: currentState(await loadConfig())
+      state: currentState((await loadConfigs())[0])
     };
   }
 }
@@ -167,21 +178,27 @@ function configForPopup(config: RuntimeConfig): Omit<RuntimeConfig, "nextSequenc
   return value;
 }
 
-async function controlTab(tab: any): Promise<void> {
+async function controlTab(tab: any, config: RuntimeConfig): Promise<void> {
   if (
     typeof tab.id !== "number" ||
     (!/^https?:/i.test(tab.url ?? "") && tab.url !== "about:blank")
   ) {
     throw new Error("select an HTTP, HTTPS, or blank tab");
   }
+  const previous = tabStates.get(tab.id);
+  const target = queueTarget(config);
+  if (previous?.target && !sameTarget(previous.target, target)) {
+    throw new Error("This tab is already controlled by another Erebus workspace. Finish or close it before another chat takes control.");
+  }
   tabStates.set(tab.id, {
     tabId: tab.id,
     ...(tab.title ? { title: tab.title } : {}),
     ...(tab.url ? { url: tab.url } : {}),
     status: "capturing",
-    captured: 0,
-    gaps: [],
-    startedAt: new Date().toISOString()
+    captured: previous?.captured ?? 0,
+    gaps: previous?.gaps ?? [],
+    startedAt: previous?.startedAt ?? new Date().toISOString(),
+    target
   });
   await persistTabs();
   await setIndicator(tab.id, "LIVE");
@@ -208,20 +225,32 @@ async function setIndicator(tabId: number, text: string): Promise<void> {
 function restartAutomationLoop(): void {
   automationGeneration += 1;
   automationConnected = false;
-  automationController?.abort();
-  automationController = undefined;
+  for (const controller of automationControllers.values()) controller.abort();
+  automationControllers.clear();
   void ensureAutomationLoop();
 }
 
 async function ensureAutomationLoop(): Promise<void> {
-  if (automationController) return;
-  const generation = ++automationGeneration;
-  const controller = new AbortController();
-  automationController = controller;
-  try {
-    while (!controller.signal.aborted && automationGeneration === generation) {
-      const config = await loadConfig();
-      if (!config) return;
+  const configs = await loadConfigs();
+  for (const config of configs) {
+    const key = runtimeKey(config);
+    if (automationControllers.has(key)) continue;
+    const generation = automationGeneration;
+    const controller = new AbortController();
+    automationControllers.set(key, controller);
+    void runAutomationLoop(config, generation, controller.signal).finally(() => {
+      if (automationControllers.get(key) === controller) automationControllers.delete(key);
+      automationConnected = automationControllers.size > 0;
+    });
+  }
+}
+
+async function runAutomationLoop(
+  config: RuntimeConfig,
+  generation: number,
+  signal: AbortSignal
+): Promise<void> {
+  while (!signal.aborted && automationGeneration === generation) {
       try {
         await pairingRequest(
           config,
@@ -233,7 +262,7 @@ async function ensureAutomationLoop(): Promise<void> {
             version: browserApi.runtime.getManifest().version,
             tabs: await automationTabs()
           },
-          controller.signal
+          signal
         );
         automationConnected = true;
         const command = await pairingRequest<ExtensionAutomationCommand | null>(
@@ -244,28 +273,23 @@ async function ensureAutomationLoop(): Promise<void> {
             producerId: config.producerId,
             waitMs: AUTOMATION_POLL_MS
           },
-          controller.signal
+          signal
         );
         if (!command) continue;
-        const result = await executeAutomation(command);
+        const result = await executeSerializedAutomationCommand(config, command);
         await pairingRequest(
           config,
           "/v1/extension/commands/result",
           { sessionId: config.sessionId, producerId: config.producerId, ...result },
-          controller.signal
+          signal
         );
       } catch {
-        if (controller.signal.aborted || automationGeneration !== generation) return;
+        if (signal.aborted || automationGeneration !== generation) return;
         automationConnected = false;
-        await ensureAutomaticPairing(true).catch(() => undefined);
+        await ensureAutomaticPairing().catch(() => undefined);
+        await ensureAutomationLoop();
         await delay(AUTOMATION_RETRY_MS);
       }
-    }
-  } finally {
-    if (automationGeneration === generation) {
-      automationController = undefined;
-      automationConnected = false;
-    }
   }
 }
 
@@ -291,21 +315,42 @@ async function automationTabs(): Promise<ExtensionAutomationTab[]> {
 }
 
 async function ensureAutomaticPairing(force = false): Promise<RuntimeConfig | undefined> {
-  const previous = await loadConfig();
-  if (previous && !force) return previous;
+  if (automaticPairingInFlight) return automaticPairingInFlight;
+  const operation = refreshAutomaticPairing(force);
+  automaticPairingInFlight = operation;
+  try {
+    return await operation;
+  } finally {
+    if (automaticPairingInFlight === operation) automaticPairingInFlight = undefined;
+  }
+}
+
+async function refreshAutomaticPairing(force: boolean): Promise<RuntimeConfig | undefined> {
+  const previous = await loadConfigs();
   const now = Date.now();
-  if (now - automaticPairingAttemptAt < AUTOMATIC_PAIRING_RETRY_MS) return previous;
+  if (!force && now - automaticPairingAttemptAt < AUTOMATIC_PAIRING_RETRY_MS) return previous[0];
   automaticPairingAttemptAt = now;
   const installId = await loadOrCreateInstallId();
-  const record = await discoverErebus(
+  const records = await discoverErebuses(
     installId,
     "firefox",
-    browserApi.runtime.getManifest().version
+    browserApi.runtime.getManifest().version,
+    previous
   );
-  if (!record) return previous;
-  const next = configFromBootstrap(record, installId, previous);
-  await browserApi.storage.local.set({ [CONFIG_KEY]: next });
-  return next;
+  if (records.length === 0) return previous[0];
+  const next = records.map((record) => {
+    const current = previous.find((config) => config.serverUrl === record.serverUrl && config.sessionId === record.sessionId);
+    if (current) return current;
+    const priorSession = previous.find((config) => config.sessionId === record.sessionId);
+    return configFromBootstrap(record, installId, priorSession);
+  });
+  const changed = next.some((config) => {
+    const prior = previous.find((candidate) => sameTarget(queueTarget(candidate), queueTarget(config)));
+    return !prior || prior.token !== config.token || prior.serverUrl !== config.serverUrl;
+  });
+  await saveConfigs(next);
+  if (changed) restartAutomationLoop();
+  return next[0];
 }
 
 async function loadOrCreateInstallId(): Promise<string> {
@@ -317,15 +362,33 @@ async function loadOrCreateInstallId(): Promise<string> {
   return installId;
 }
 
-async function executeAutomation(command: ExtensionAutomationCommand): Promise<ExtensionAutomationResult> {
+async function executeSerializedAutomationCommand(
+  config: RuntimeConfig,
+  command: ExtensionAutomationCommand
+): Promise<ExtensionAutomationResult> {
+  const tabId = command.tabId;
+  const executeCommand = () => executeAutomation(config, command);
+  if (tabId === undefined) return executeCommand();
+  const previous = tabCommandChains.get(tabId) ?? Promise.resolve();
+  const operation = previous.catch(() => undefined).then(executeCommand);
+  const tail = operation.then(() => undefined, () => undefined);
+  tabCommandChains.set(tabId, tail);
   try {
-    return { commandId: command.id, ok: true, result: await execute(command) };
+    return await operation;
+  } finally {
+    if (tabCommandChains.get(tabId) === tail) tabCommandChains.delete(tabId);
+  }
+}
+
+async function executeAutomation(config: RuntimeConfig, command: ExtensionAutomationCommand): Promise<ExtensionAutomationResult> {
+  try {
+    return { commandId: command.id, ok: true, result: await execute(config, command) };
   } catch (cause) {
     return { commandId: command.id, ok: false, error: automationError(cause) };
   }
 }
 
-async function execute(command: ExtensionAutomationCommand): Promise<unknown> {
+async function execute(config: RuntimeConfig, command: ExtensionAutomationCommand): Promise<unknown> {
   const input = command.input ?? {};
   if (command.operation === "tabsList") return { tabs: await listAutomationTabs() };
   if (command.operation === "open") {
@@ -337,7 +400,7 @@ async function execute(command: ExtensionAutomationCommand): Promise<unknown> {
           active: input.open !== false
         })
       : await browserApi.tabs.create({ url: "about:blank", active: input.open !== false });
-    await controlTab(tab);
+    await controlTab(tab, config);
     if (!reuse && url && url !== "about:blank") {
       await browserApi.tabs.update(tab.id, { url, active: input.open !== false });
     }
@@ -347,11 +410,11 @@ async function execute(command: ExtensionAutomationCommand): Promise<unknown> {
   const tabId = requiredTabId(command);
   if (command.operation === "navigate") {
     await browserApi.tabs.update(tabId, { url: requiredString(input.url, "url") });
-    await ensureControlled(tabId);
+    await ensureControlled(tabId, config);
     await waitForLoad(tabId, optionalNumber(input.timeoutMs) ?? command.timeoutMs);
     return status(tabId);
   }
-  await ensureControlled(tabId);
+  await ensureControlled(tabId, config);
   switch (command.operation) {
     case "status":
       return status(tabId);
@@ -406,9 +469,10 @@ async function listAutomationTabs(): Promise<Record<string, unknown>[]> {
   }));
 }
 
-async function ensureControlled(tabId: number): Promise<void> {
-  if (tabStates.has(tabId)) return;
-  await controlTab(await browserApi.tabs.get(tabId));
+async function ensureControlled(tabId: number, config: RuntimeConfig): Promise<void> {
+  const current = tabStates.get(tabId);
+  if (current?.target && sameTarget(current.target, queueTarget(config))) return;
+  await controlTab(await browserApi.tabs.get(tabId), config);
 }
 
 async function status(tabId: number): Promise<Record<string, unknown>> {
@@ -552,15 +616,35 @@ async function pairingRequest<T = unknown>(
   return (await response.json()) as T;
 }
 
-async function loadConfig(): Promise<RuntimeConfig | undefined> {
+async function loadConfigs(): Promise<RuntimeConfig[]> {
   const result = await browserApi.storage.local.get([CONFIG_KEY]);
-  return result[CONFIG_KEY] as RuntimeConfig | undefined;
+  const value = result[CONFIG_KEY] as RuntimeConfig | RuntimeSettings | undefined;
+  if (!value) return [];
+  if (Array.isArray((value as RuntimeSettings).configs)) {
+    return (value as RuntimeSettings).configs.filter(
+      (config): config is RuntimeConfig =>
+        Boolean(config && typeof config.serverUrl === "string" && typeof config.sessionId === "string"),
+    );
+  }
+  return typeof (value as RuntimeConfig).serverUrl === "string" ? [value as RuntimeConfig] : [];
+}
+
+async function saveConfigs(configs: RuntimeConfig[]): Promise<void> {
+  await browserApi.storage.local.set({ [CONFIG_KEY]: { configs } satisfies RuntimeSettings });
 }
 
 async function requireConfig(): Promise<RuntimeConfig> {
-  const config = await loadConfig();
+  const config = (await loadConfigs())[0];
   if (!config) throw new Error("pair the extension with an Erebus capture session first");
   return config;
+}
+
+async function configForTarget(target: QueueTarget): Promise<RuntimeConfig | undefined> {
+  return (await loadConfigs()).find((config) => sameTarget(queueTarget(config), target));
+}
+
+function runtimeKey(config: RuntimeConfig): string {
+  return `${config.serverUrl}\u0000${config.sessionId}`;
 }
 
 async function persistTabs(): Promise<void> {
