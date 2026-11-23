@@ -74,7 +74,7 @@ function api(initialUrl = "about:blank") {
 describe("extension automation navigation", () => {
   it("fails a stuck browser command without blocking the next poll", async () => {
     const { automationApi } = api();
-    automationApi.attachedTabs = vi.fn(() => new Promise(() => undefined));
+    automationApi.attachedTabs = vi.fn(() => new Promise<never>(() => undefined));
 
     const result = await executeChromiumAutomationCommand(
       { ...command("tabsList", {}), timeoutMs: 10 },
