@@ -113,6 +113,8 @@ let automationConnected = false;
 let automationGeneration = 0;
 let automationController: AbortController | undefined;
 let automaticPairingAttemptAt = 0;
+const activeRecordings = new Map<number, { startedAt: string }>();
+let offscreenCreation: Promise<void> | undefined;
 
 void initialize();
 
@@ -294,6 +296,9 @@ async function attachTab(tabId: number, restoring: boolean): Promise<void> {
     maxResourceBufferSize: 2 * 1024 * 1024,
     maxTotalBufferSize: 16 * 1024 * 1024
   });
+  if (activeRecordings.has(tabId)) {
+    await startTabScreencast(tabId);
+  }
 
   pendingRequests.set(tabId, new Map());
   pendingSockets.set(tabId, new Map());
@@ -322,6 +327,7 @@ async function stopTab(tabId: number): Promise<void> {
   }
   pendingRequests.delete(tabId);
   pendingSockets.delete(tabId);
+  await discardTabRecording(tabId);
   await persistTabs();
   try {
     intentionalDetaches.add(tabId);
@@ -341,6 +347,9 @@ async function handleDebuggerEvent(
   params: Record<string, unknown>
 ): Promise<void> {
   switch (method) {
+    case "Page.screencastFrame":
+      await onScreencastFrame(tabId, params);
+      break;
     case "Network.requestWillBeSent":
       await onRequestWillBeSent(tabId, params);
       break;
@@ -964,8 +973,110 @@ const chromiumAutomationApi = {
   async closeTab(tabId: number): Promise<void> {
     await chrome.tabs.remove(tabId);
   },
+  startRecording: startTabRecording,
+  stopRecording: stopTabRecording,
   sendCommand
 };
+
+async function startTabRecording(tabId: number): Promise<{ startedAt: string }> {
+  const current = activeRecordings.get(tabId);
+  if (current) return current;
+  await ensureOffscreenDocument();
+  const response = await sendOffscreenMessage<{ startedAt: string }>({
+    type: "erebus-recording-start",
+    tabId
+  });
+  const recording = { startedAt: response.startedAt };
+  activeRecordings.set(tabId, recording);
+  try {
+    await startTabScreencast(tabId);
+    return recording;
+  } catch (error) {
+    activeRecordings.delete(tabId);
+    await sendOffscreenMessage({ type: "erebus-recording-discard", tabId }).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function stopTabRecording(tabId: number): Promise<{
+  startedAt: string;
+  mimeType: string;
+  dataBase64: string;
+}> {
+  if (!activeRecordings.has(tabId)) throw new Error("browser recording is not active for this tab");
+  await sendCommand(tabId, "Page.stopScreencast").catch(() => undefined);
+  try {
+    return await sendOffscreenMessage({ type: "erebus-recording-stop", tabId });
+  } finally {
+    activeRecordings.delete(tabId);
+  }
+}
+
+async function discardTabRecording(tabId: number): Promise<void> {
+  if (!activeRecordings.delete(tabId)) return;
+  await sendCommand(tabId, "Page.stopScreencast").catch(() => undefined);
+  await ensureOffscreenDocument().catch(() => undefined);
+  await sendOffscreenMessage({ type: "erebus-recording-discard", tabId }).catch(() => undefined);
+}
+
+async function startTabScreencast(tabId: number): Promise<void> {
+  await sendCommand(tabId, "Page.startScreencast", {
+    format: "jpeg",
+    quality: 80,
+    everyNthFrame: 1
+  });
+}
+
+async function onScreencastFrame(
+  tabId: number,
+  params: Record<string, unknown>
+): Promise<void> {
+  const sessionId = params.sessionId;
+  if (typeof sessionId !== "number") return;
+  try {
+    if (activeRecordings.has(tabId) && typeof params.data === "string") {
+      await sendOffscreenMessage({
+        type: "erebus-recording-frame",
+        tabId,
+        data: params.data
+      });
+    }
+  } finally {
+    await sendCommand(tabId, "Page.screencastFrameAck", { sessionId }).catch(() => undefined);
+  }
+}
+
+async function ensureOffscreenDocument(): Promise<void> {
+  if (offscreenCreation) return offscreenCreation;
+  offscreenCreation = (async () => {
+    const documentUrl = chrome.runtime.getURL("offscreen.html");
+    const contexts = await chrome.runtime.getContexts({
+      contextTypes: [chrome.runtime.ContextType.OFFSCREEN_DOCUMENT],
+      documentUrls: [documentUrl]
+    });
+    if (contexts.length > 0) return;
+    await chrome.offscreen.createDocument({
+      url: "offscreen.html",
+      reasons: [chrome.offscreen.Reason.USER_MEDIA],
+      justification: "Encode agent-requested browser tab recordings from DevTools screencast frames."
+    });
+  })();
+  try {
+    await offscreenCreation;
+  } finally {
+    offscreenCreation = undefined;
+  }
+}
+
+async function sendOffscreenMessage<T = unknown>(message: Record<string, unknown>): Promise<T> {
+  const response = (await chrome.runtime.sendMessage(message)) as
+    | { ok: true; result: T }
+    | { ok: false; error: string }
+    | undefined;
+  if (!response) throw new Error("browser recording worker did not respond");
+  if (!response.ok) throw new Error(response.error);
+  return response.result;
+}
 
 async function automationTabs(): Promise<import("./protocol").ExtensionAutomationTab[]> {
   const tabs = await chromiumAutomationApi.attachedTabs();
@@ -1084,6 +1195,7 @@ async function closeRemovedTab(tabId: number): Promise<void> {
   });
   pendingRequests.delete(tabId);
   pendingSockets.delete(tabId);
+  await discardTabRecording(tabId);
   await enqueueCaptureGap(lost, gap.reason, gap.at);
   await persistTabs();
 }

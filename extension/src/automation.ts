@@ -7,6 +7,12 @@ export interface ChromiumAutomationApi {
   getTab(tabId: number): Promise<chrome.tabs.Tab>;
   updateTab(tabId: number, update: chrome.tabs.UpdateProperties): Promise<chrome.tabs.Tab>;
   closeTab(tabId: number): Promise<void>;
+  startRecording(tabId: number): Promise<{ startedAt: string }>;
+  stopRecording(tabId: number): Promise<{
+    startedAt: string;
+    mimeType: string;
+    dataBase64: string;
+  }>;
   sendCommand(
     tabId: number,
     method: string,
@@ -26,6 +32,18 @@ const PRESET_VIEWPORTS: Record<string, { width: number; height: number }> = {
   "desktop-1280": { width: 1280, height: 720 },
   "desktop-1440": { width: 1440, height: 900 }
 };
+
+export function implicitInputRole(type: string): string | null {
+  const normalized = type.toLowerCase();
+  if (normalized === "checkbox") return "checkbox";
+  if (normalized === "radio") return "radio";
+  if (["button", "submit", "reset", "image"].includes(normalized)) return "button";
+  if (normalized === "range") return "slider";
+  if (normalized === "number") return "spinbutton";
+  if (normalized === "search") return "searchbox";
+  if (normalized === "hidden") return null;
+  return "textbox";
+}
 
 export async function executeChromiumAutomationCommand(
   command: ExtensionAutomationCommand,
@@ -82,8 +100,17 @@ async function execute(
   const tabId = requiredTabId(command);
   if (command.operation === "navigate") {
     const url = requiredString(input.url, "url");
-    await api.updateTab(tabId, { url });
-    await api.ensureAttached(tabId);
+    const tab = await api.getTab(tabId);
+    if (isRestrictedBrowserUrl(tab.url ?? tab.pendingUrl)) {
+      await api.updateTab(tabId, { url });
+      await api.ensureAttached(tabId);
+    } else {
+      await api.ensureAttached(tabId);
+      const navigation = await api.sendCommand(tabId, "Page.navigate", { url });
+      if (typeof navigation.errorText === "string" && navigation.errorText.length > 0) {
+        throw new Error(`browser navigation failed: ${navigation.errorText}`);
+      }
+    }
     await waitForReadiness(
       tabId,
       api,
@@ -134,12 +161,12 @@ async function execute(
     case "waitFor":
       await waitForConditions(tabId, input, api, command.timeoutMs);
       return undefined;
-    case "recordingStart":
+    case "recordingStart": {
+      const recording = await api.startRecording(tabId);
+      return { tabId, recording: true, startedAt: recording.startedAt };
+    }
     case "recordingStop":
-      throw taggedError(
-        "PreviewAutomationUnsupportedClientError",
-        "Recording is available in the Erebus browser. The browser extension does not request tab-capture permission."
-      );
+      return { tabId, ...(await api.stopRecording(tabId)) };
     default:
       throw taggedError(
         "PreviewAutomationUnsupportedClientError",
@@ -244,6 +271,7 @@ async function setColorScheme(
 }
 
 async function snapshot(tabId: number, api: ChromiumAutomationApi): Promise<Record<string, unknown>> {
+  const inputRoleSource = implicitInputRole.toString();
   const payload = objectValue(
     await runtimeValue(
       tabId,
@@ -254,8 +282,22 @@ async function snapshot(tabId: number, api: ChromiumAutomationApi): Promise<Reco
           const rect = el.getBoundingClientRect();
           return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
         };
-        const roleOf = (el) => el.getAttribute('role') || ({A:'link',BUTTON:'button',INPUT:'textbox',SELECT:'combobox',TEXTAREA:'textbox'}[el.tagName] || null);
-        const nameOf = (el) => (el.getAttribute('aria-label') || el.getAttribute('title') || el.innerText || el.value || el.getAttribute('name') || '').trim().slice(0, 500);
+        const roleOf = (el) => {
+          const explicit = el.getAttribute('role');
+          if (explicit) return explicit;
+          if (el.tagName === 'INPUT') {
+            const type = (el.getAttribute('type') || 'text').toLowerCase();
+            return (${inputRoleSource})(type);
+          }
+          return ({A:'link',BUTTON:'button',SELECT:'combobox',TEXTAREA:'textbox'}[el.tagName] || null);
+        };
+        const nameOf = (el) => {
+          const labelledBy = (el.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
+            .map((id) => document.getElementById(id)?.innerText || document.getElementById(id)?.textContent || '')
+            .join(' ').trim();
+          const label = el.labels?.length ? Array.from(el.labels).map((item) => item.innerText || item.textContent || '').join(' ').trim() : '';
+          return (el.getAttribute('aria-label') || labelledBy || label || el.getAttribute('title') || el.getAttribute('placeholder') || el.innerText || el.value || el.getAttribute('name') || '').trim().slice(0, 500);
+        };
         const selectorOf = (el) => {
           if (el.id) return '#' + CSS.escape(el.id);
           const parts = [];
@@ -531,6 +573,11 @@ function elementPointExpression(input: CommandInput): string {
 function requiredTabId(command: ExtensionAutomationCommand): number {
   if (command.tabId === undefined) throw new Error("tab id is required");
   return command.tabId;
+}
+
+function isRestrictedBrowserUrl(url: string | undefined): boolean {
+  if (!url) return true;
+  return !/^(?:https?:|about:blank$)/i.test(url);
 }
 
 function requiredString(value: unknown, name: string): string {

@@ -9,6 +9,7 @@ await mkdir("dist", { recursive: true });
 await build({
   entryPoints: {
     background: "src/background.ts",
+    offscreen: "src/offscreen.ts",
     popup: "src/popup.ts"
   },
   outdir: "dist",
@@ -21,6 +22,7 @@ await build({
 
 await Promise.all([
   cp("manifest.json", "dist/manifest.json"),
+  cp("src/offscreen.html", "dist/offscreen.html"),
   cp("src/popup.html", "dist/popup.html"),
   cp("src/popup.css", "dist/popup.css")
 ]);

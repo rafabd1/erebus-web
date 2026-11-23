@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   executeChromiumAutomationCommand,
+  implicitInputRole,
   type ChromiumAutomationApi
 } from "../src/automation";
 
@@ -20,9 +21,9 @@ function command(
   };
 }
 
-function api() {
+function api(initialUrl = "about:blank") {
   const state = {
-    url: "about:blank",
+    url: initialUrl,
     status: "complete" as chrome.tabs.TabStatus
   };
   const calls: string[] = [];
@@ -46,6 +47,12 @@ function api() {
       return { id: tabId, url: state.url, active: true, status: state.status } as chrome.tabs.Tab;
     }),
     closeTab: vi.fn(async () => undefined),
+    startRecording: vi.fn(async () => ({ startedAt: "2026-11-22T00:00:00.000Z" })),
+    stopRecording: vi.fn(async () => ({
+      startedAt: "2026-11-22T00:00:00.000Z",
+      mimeType: "video/webm",
+      dataBase64: "AA=="
+    })),
     sendCommand: vi.fn(async (_tabId, method, params) => {
       if (method === "Runtime.evaluate") {
         if (params?.expression === "document.readyState") {
@@ -64,6 +71,15 @@ function api() {
 }
 
 describe("extension automation navigation", () => {
+  it("reports native input roles instead of flattening controls to textboxes", () => {
+    expect(implicitInputRole("radio")).toBe("radio");
+    expect(implicitInputRole("checkbox")).toBe("checkbox");
+    expect(implicitInputRole("submit")).toBe("button");
+    expect(implicitInputRole("search")).toBe("searchbox");
+    expect(implicitInputRole("text")).toBe("textbox");
+    expect(implicitInputRole("hidden")).toBeNull();
+  });
+
   it("attaches a new blank tab before navigating to the requested URL", async () => {
     const { automationApi, calls } = api();
 
@@ -85,7 +101,7 @@ describe("extension automation navigation", () => {
   });
 
   it("navigates a restricted existing tab before attaching the debugger", async () => {
-    const { automationApi, calls } = api();
+    const { automationApi, calls } = api("chrome://newtab/");
 
     const result = await executeChromiumAutomationCommand(
       command("navigate", { url: "https://example.com" }, 23),
@@ -95,6 +111,45 @@ describe("extension automation navigation", () => {
     expect(result.ok).toBe(true);
     expect(result.result).toMatchObject({ viewportSetting: { _tag: "fill" } });
     expect(calls.slice(0, 2)).toEqual(["update:https://example.com", "attach"]);
+  });
+
+  it("navigates an attached web tab through the debugger", async () => {
+    const { automationApi, calls } = api();
+    await automationApi.updateTab(23, { url: "https://example.org" });
+    calls.length = 0;
+
+    const result = await executeChromiumAutomationCommand(
+      command("navigate", { url: "https://example.com" }, 23),
+      automationApi
+    );
+
+    expect(result.ok).toBe(true);
+    expect(calls).toEqual(["attach"]);
+    expect(automationApi.sendCommand).toHaveBeenCalledWith(23, "Page.navigate", {
+      url: "https://example.com"
+    });
+  });
+
+  it("delegates recording lifecycle to the browser runtime", async () => {
+    const { automationApi } = api();
+
+    const started = await executeChromiumAutomationCommand(
+      command("recordingStart", {}, 23),
+      automationApi
+    );
+    const stopped = await executeChromiumAutomationCommand(
+      command("recordingStop", {}, 23),
+      automationApi
+    );
+
+    expect(started).toMatchObject({
+      ok: true,
+      result: { tabId: 23, recording: true, startedAt: "2026-11-22T00:00:00.000Z" }
+    });
+    expect(stopped).toMatchObject({
+      ok: true,
+      result: { tabId: 23, mimeType: "video/webm", dataBase64: "AA==" }
+    });
   });
 
   it("returns resize settings in the shared preview contract shape", async () => {
