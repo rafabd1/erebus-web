@@ -329,16 +329,28 @@ async function execute(command: ExtensionAutomationCommand): Promise<unknown> {
   const input = command.input ?? {};
   if (command.operation === "tabsList") return { tabs: await listAutomationTabs() };
   if (command.operation === "open") {
-    const url = optionalString(input.url) ?? "about:blank";
+    const url = optionalString(input.url);
     const reuse = input.reuseExistingTab !== false && command.tabId !== undefined;
     const tab = reuse
-      ? await browserApi.tabs.update(command.tabId, { url, active: input.open !== false })
-      : await browserApi.tabs.create({ url, active: input.open !== false });
+      ? await browserApi.tabs.update(command.tabId, {
+          ...(url ? { url } : {}),
+          active: input.open !== false
+        })
+      : await browserApi.tabs.create({ url: "about:blank", active: input.open !== false });
     await controlTab(tab);
+    if (!reuse && url && url !== "about:blank") {
+      await browserApi.tabs.update(tab.id, { url, active: input.open !== false });
+    }
     await waitForLoad(tab.id, command.timeoutMs);
     return status(tab.id);
   }
   const tabId = requiredTabId(command);
+  if (command.operation === "navigate") {
+    await browserApi.tabs.update(tabId, { url: requiredString(input.url, "url") });
+    await ensureControlled(tabId);
+    await waitForLoad(tabId, optionalNumber(input.timeoutMs) ?? command.timeoutMs);
+    return status(tabId);
+  }
   await ensureControlled(tabId);
   switch (command.operation) {
     case "status":
@@ -346,10 +358,6 @@ async function execute(command: ExtensionAutomationCommand): Promise<unknown> {
     case "tabClose":
       await browserApi.tabs.remove(tabId);
       return { closedTabId: tabId, tabId: null };
-    case "navigate":
-      await browserApi.tabs.update(tabId, { url: requiredString(input.url, "url") });
-      await waitForLoad(tabId, optionalNumber(input.timeoutMs) ?? command.timeoutMs);
-      return status(tabId);
     case "back":
       await browserApi.tabs.goBack(tabId);
       await waitForLoad(tabId, command.timeoutMs);
