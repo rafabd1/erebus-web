@@ -45,6 +45,30 @@ export function implicitInputRole(type: string): string | null {
   return "textbox";
 }
 
+export function roleLocatorExpression(roleName: string, name?: string): string {
+  const selectors: Record<string, string> = {
+    button: "button,[role='button'],input[type='button'],input[type='submit']",
+    link: "a[href],[role='link']",
+    textbox:
+      "input:not([type]),input[type='text'],input[type='email'],input[type='search'],input[type='url'],input[type='password'],textarea,[role='textbox']",
+    checkbox: "input[type='checkbox'],[role='checkbox']",
+    radio: "input[type='radio'],[role='radio']",
+    combobox: "select,[role='combobox']"
+  };
+  const selector = selectors[roleName] ?? `[role=${JSON.stringify(roleName)}]`;
+  if (name === undefined) return `document.querySelector(${JSON.stringify(selector)})`;
+  return `(() => {
+    const nameOf = (el) => {
+      const labelledBy = (el.getAttribute('aria-labelledby') || '').split(/\\s+/).filter(Boolean)
+        .map((id) => document.getElementById(id)?.innerText || document.getElementById(id)?.textContent || '')
+        .join(' ').trim();
+      const label = el.labels?.length ? Array.from(el.labels).map((item) => item.innerText || item.textContent || '').join(' ').trim() : '';
+      return (el.getAttribute('aria-label') || labelledBy || label || el.getAttribute('title') || el.getAttribute('placeholder') || el.innerText || el.value || '').trim();
+    };
+    return Array.from(document.querySelectorAll(${JSON.stringify(selector)})).find((el) => nameOf(el) === ${JSON.stringify(name)});
+  })()`;
+}
+
 export async function executeChromiumAutomationCommand(
   command: ExtensionAutomationCommand,
   api: ChromiumAutomationApi
@@ -545,17 +569,7 @@ function targetExpression(input: CommandInput): string {
   if (role) {
     const roleName = role[1] ?? "";
     const name = role[2] ?? role[3];
-    const selectors: Record<string, string> = {
-      button: "button,[role='button'],input[type='button'],input[type='submit']",
-      link: "a[href],[role='link']",
-      textbox: "input:not([type]),input[type='text'],input[type='email'],input[type='search'],input[type='url'],input[type='password'],textarea,[role='textbox']",
-      checkbox: "input[type='checkbox'],[role='checkbox']",
-      radio: "input[type='radio'],[role='radio']",
-      combobox: "select,[role='combobox']"
-    };
-    const selector = selectors[roleName] ?? `[role=${JSON.stringify(roleName)}]`;
-    if (name === undefined) return `document.querySelector(${JSON.stringify(selector)})`;
-    return `Array.from(document.querySelectorAll(${JSON.stringify(selector)})).find((el) => ((el.getAttribute('aria-label') || el.getAttribute('title') || el.innerText || el.value || '').trim() === ${JSON.stringify(name)}))`;
+    return roleLocatorExpression(roleName, name);
   }
   return `document.querySelector(${JSON.stringify(locator)})`;
 }
