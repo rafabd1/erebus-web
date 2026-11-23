@@ -72,6 +72,19 @@ function api(initialUrl = "about:blank") {
 }
 
 describe("extension automation navigation", () => {
+  it("fails a stuck browser command without blocking the next poll", async () => {
+    const { automationApi } = api();
+    automationApi.attachedTabs = vi.fn(() => new Promise(() => undefined));
+
+    const result = await executeChromiumAutomationCommand(
+      { ...command("tabsList", {}), timeoutMs: 10 },
+      automationApi
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatchObject({ message: "browser command timed out after 10 ms" });
+  });
+
   it("reports native input roles instead of flattening controls to textboxes", () => {
     expect(implicitInputRole("radio")).toBe("radio");
     expect(implicitInputRole("checkbox")).toBe("checkbox");

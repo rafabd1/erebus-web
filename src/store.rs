@@ -97,6 +97,7 @@ impl Store {
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=FULL;
+             PRAGMA wal_autocheckpoint=64;
              PRAGMA foreign_keys=ON;
              PRAGMA auto_vacuum=INCREMENTAL;",
         )?;
@@ -319,30 +320,53 @@ impl Store {
     }
 
     pub fn end_session(&self, id: &str) -> anyhow::Result<Option<CaptureSession>> {
-        let connection = self.writer()?;
-        let ended_at = now();
-        connection.execute(
-            "UPDATE capture_sessions SET ended_at = COALESCE(ended_at, ?2) WHERE id = ?1",
-            params![id, ended_at],
-        )?;
-        connection
-            .query_row(
-                "SELECT id, label, source, started_at, ended_at, scope_profile_id
-                 FROM capture_sessions WHERE id = ?1",
-                [id],
-                |row| {
-                    Ok(CaptureSession {
-                        id: row.get(0)?,
-                        label: row.get(1)?,
-                        source: row.get(2)?,
-                        started_at: row.get(3)?,
-                        ended_at: row.get(4)?,
-                        scope_profile_id: row.get(5)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(Into::into)
+        let session = {
+            let connection = self.writer()?;
+            let ended_at = now();
+            connection.execute(
+                "UPDATE capture_sessions SET ended_at = COALESCE(ended_at, ?2) WHERE id = ?1",
+                params![id, ended_at],
+            )?;
+            connection
+                .query_row(
+                    "SELECT id, label, source, started_at, ended_at, scope_profile_id
+                     FROM capture_sessions WHERE id = ?1",
+                    [id],
+                    |row| {
+                        Ok(CaptureSession {
+                            id: row.get(0)?,
+                            label: row.get(1)?,
+                            source: row.get(2)?,
+                            started_at: row.get(3)?,
+                            ended_at: row.get(4)?,
+                            scope_profile_id: row.get(5)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(anyhow::Error::from)?
+        };
+        let checkpoint_result = Connection::open(&self.database_path).and_then(|checkpoint| {
+            checkpoint.busy_timeout(std::time::Duration::from_secs(5))?;
+            checkpoint.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+            })
+        });
+        match checkpoint_result {
+            Ok((0, _, _)) => {}
+            Ok((_, log_frames, checkpointed_frames)) => tracing::warn!(
+                %id,
+                log_frames,
+                checkpointed_frames,
+                "capture ended but the workspace database checkpoint is still busy"
+            ),
+            Err(error) => tracing::warn!(
+                %error,
+                %id,
+                "capture ended but the workspace database checkpoint was deferred"
+            ),
+        }
+        Ok(session)
     }
 
     pub fn delete_session(&self, id: &str) -> anyhow::Result<Option<SessionDeleteResult>> {
@@ -3307,6 +3331,44 @@ mod tests {
             .unwrap_err();
         assert!(is_input_error(&error));
         assert!(error.to_string().contains("has ended"));
+    }
+
+    #[test]
+    fn ending_a_session_checkpoints_the_workspace_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let session = store
+            .create_session(CreateSession {
+                label: "checkpoint".into(),
+                source: "proxy".into(),
+                scope_profile_id: None,
+            })
+            .unwrap();
+        store
+            .ingest_http(HttpIngestBatch {
+                producer_id: "checkpoint-producer".into(),
+                session_id: session.id.clone(),
+                events: vec![event(
+                    1,
+                    "https://example.com/checkpoint",
+                    "2026-11-20T12:00:00Z",
+                )],
+            })
+            .unwrap();
+
+        store.end_session(&session.id).unwrap();
+
+        let snapshot_path = temp.path().join("traffic-snapshot.sqlite");
+        std::fs::copy(temp.path().join("traffic.sqlite"), &snapshot_path).unwrap();
+        let snapshot = Connection::open(snapshot_path).unwrap();
+        let count: i64 = snapshot
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+                [&session.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]

@@ -73,8 +73,15 @@ export async function executeChromiumAutomationCommand(
   command: ExtensionAutomationCommand,
   api: ChromiumAutomationApi
 ): Promise<ExtensionAutomationResult> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const result = await execute(command, api);
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`browser command timed out after ${command.timeoutMs} ms`)),
+        command.timeoutMs
+      );
+    });
+    const result = await Promise.race([execute(command, api), timeout]);
     return { commandId: command.id, ok: true, result };
   } catch (cause) {
     return {
@@ -82,6 +89,8 @@ export async function executeChromiumAutomationCommand(
       ok: false,
       error: automationError(cause)
     };
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 
