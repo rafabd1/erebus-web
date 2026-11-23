@@ -73,6 +73,10 @@ describe("extension automation navigation", () => {
     );
 
     expect(result.ok).toBe(true);
+    expect(result.result).toMatchObject({
+      viewportSetting: { _tag: "fill" },
+      viewport: { width: 1280, height: 720 }
+    });
     expect(calls.slice(0, 3)).toEqual([
       "create:about:blank",
       "attach",
@@ -89,6 +93,28 @@ describe("extension automation navigation", () => {
     );
 
     expect(result.ok).toBe(true);
+    expect(result.result).toMatchObject({ viewportSetting: { _tag: "fill" } });
     expect(calls.slice(0, 2)).toEqual(["update:https://example.com", "attach"]);
+  });
+
+  it("returns resize settings in the shared preview contract shape", async () => {
+    const { automationApi } = api();
+
+    const result = await executeChromiumAutomationCommand(
+      command("resize", { mode: "preset", preset: "iphone-15-pro" }, 23),
+      automationApi
+    );
+
+    expect(result).toMatchObject({
+      ok: true,
+      result: {
+        setting: {
+          _tag: "preset",
+          presetId: "iphone-15-pro",
+          width: 393,
+          height: 852
+        }
+      }
+    });
   });
 });

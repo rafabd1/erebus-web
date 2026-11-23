@@ -163,7 +163,7 @@ async function status(tabId: number, api: ChromiumAutomationApi): Promise<Record
     url: tab.url ?? null,
     title: tab.title ?? null,
     loading: tab.status === "loading" || viewport.readyState === "loading",
-    viewportSetting: { mode: "fill" },
+    viewportSetting: { _tag: "fill" },
     viewport: {
       width: finiteInteger(viewport.width, 1),
       height: finiteInteger(viewport.height, 1)
@@ -190,6 +190,7 @@ async function resize(
   api: ChromiumAutomationApi
 ): Promise<Record<string, unknown>> {
   const mode = requiredString(input.mode, "mode");
+  let setting: Record<string, unknown> = { _tag: "fill" };
   if (mode === "fill") {
     await api.sendCommand(tabId, "Emulation.clearDeviceMetricsOverride");
   } else {
@@ -209,16 +210,20 @@ async function resize(
       deviceScaleFactor: 1,
       mobile: mode === "preset" && !String(input.preset).startsWith("desktop-")
     });
+    setting =
+      mode === "freeform"
+        ? { _tag: "freeform", width: Math.round(width), height: Math.round(height) }
+        : {
+            _tag: "preset",
+            presetId: requiredString(input.preset, "preset"),
+            width: Math.round(width),
+            height: Math.round(height)
+          };
   }
   const current = await status(tabId, api);
   return {
     tabId,
-    setting:
-      mode === "fill"
-        ? { mode: "fill" }
-        : mode === "freeform"
-          ? { mode, width: input.width, height: input.height }
-          : { mode, preset: input.preset, ...(input.orientation ? { orientation: input.orientation } : {}) },
+    setting,
     viewport: current.viewport
   };
 }

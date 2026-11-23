@@ -422,7 +422,7 @@ async function status(tabId: number): Promise<Record<string, unknown>> {
     url: tab.url ?? page.url ?? null,
     title: tab.title ?? page.title ?? null,
     loading: tab.status === "loading" || page.loading === true,
-    viewportSetting: { mode: "fill" },
+    viewportSetting: { _tag: "fill" },
     viewport: {
       width: finiteInteger(page.width ?? window.width, 1),
       height: finiteInteger(page.height ?? window.height, 1)
@@ -434,7 +434,7 @@ async function resize(tabId: number, input: Record<string, unknown>): Promise<Re
   const tab = await browserApi.tabs.get(tabId);
   const mode = requiredString(input.mode, "mode");
   if (mode === "fill") {
-    return { tabId, setting: { mode: "fill" }, viewport: (await status(tabId)).viewport };
+    return { tabId, setting: { _tag: "fill" }, viewport: (await status(tabId)).viewport };
   }
   let width = optionalNumber(input.width);
   let height = optionalNumber(input.height);
@@ -448,12 +448,18 @@ async function resize(tabId: number, input: Record<string, unknown>): Promise<Re
   if (!width || !height) throw new Error("viewport width and height are required");
   await browserApi.windows.update(tab.windowId, { width: Math.round(width), height: Math.round(height) });
   const current = await status(tabId);
+  const setting =
+    mode === "freeform"
+      ? { _tag: "freeform", width: Math.round(width), height: Math.round(height) }
+      : {
+          _tag: "preset",
+          presetId: requiredString(input.preset, "preset"),
+          width: Math.round(width),
+          height: Math.round(height)
+        };
   return {
     tabId,
-    setting:
-      mode === "freeform"
-        ? { mode, width: input.width, height: input.height }
-        : { mode, preset: input.preset, ...(input.orientation ? { orientation: input.orientation } : {}) },
+    setting,
     viewport: current.viewport
   };
 }
