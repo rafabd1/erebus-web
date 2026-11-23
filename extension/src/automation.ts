@@ -2,7 +2,6 @@ import type { ExtensionAutomationCommand, ExtensionAutomationResult } from "./pr
 
 export interface ChromiumAutomationApi {
   attachedTabs(): Promise<chrome.tabs.Tab[]>;
-  isAttached(tabId: number): Promise<boolean>;
   ensureAttached(tabId: number): Promise<void>;
   createTab(url?: string): Promise<chrome.tabs.Tab>;
   getTab(tabId: number): Promise<chrome.tabs.Tab>;

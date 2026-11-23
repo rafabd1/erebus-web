@@ -23,16 +23,13 @@ function command(
 function api() {
   const state = {
     url: "about:blank",
-    status: "complete" as chrome.tabs.TabStatus,
-    attached: false
+    status: "complete" as chrome.tabs.TabStatus
   };
   const calls: string[] = [];
   const automationApi: ChromiumAutomationApi = {
     attachedTabs: vi.fn(async () => []),
-    isAttached: vi.fn(async () => state.attached),
     ensureAttached: vi.fn(async () => {
       calls.push("attach");
-      state.attached = true;
     }),
     createTab: vi.fn(async (url) => {
       calls.push(`create:${url}`);

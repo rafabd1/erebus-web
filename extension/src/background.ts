@@ -946,12 +946,8 @@ const chromiumAutomationApi = {
   async attachedTabs(): Promise<chrome.tabs.Tab[]> {
     return chrome.tabs.query({});
   },
-  async isAttached(tabId: number): Promise<boolean> {
-    const targets = await chrome.debugger.getTargets();
-    return targets.some((target) => target.tabId === tabId && target.attached);
-  },
   async ensureAttached(tabId: number): Promise<void> {
-    if (await this.isAttached(tabId)) return;
+    if (tabStates.get(tabId)?.status === "capturing") return;
     await attachTab(tabId, true);
   },
   createTab(url?: string): Promise<chrome.tabs.Tab> {
