@@ -266,7 +266,8 @@ async function attachTab(tabId: number, restoring: boolean): Promise<void> {
   const config = await requireConfig();
   void config;
   const tab = await chrome.tabs.get(tabId);
-  if (!tab.url || (!/^https?:/i.test(tab.url) && tab.url !== "about:blank")) {
+  const targetUrl = tab.url || tab.pendingUrl;
+  if (!targetUrl || (!/^https?:/i.test(targetUrl) && targetUrl !== "about:blank")) {
     throw new Error("select an HTTP, HTTPS, or blank tab");
   }
 
@@ -945,10 +946,13 @@ const chromiumAutomationApi = {
   async attachedTabs(): Promise<chrome.tabs.Tab[]> {
     return chrome.tabs.query({});
   },
+  async isAttached(tabId: number): Promise<boolean> {
+    const targets = await chrome.debugger.getTargets();
+    return targets.some((target) => target.tabId === tabId && target.attached);
+  },
   async ensureAttached(tabId: number): Promise<void> {
-    const state = tabStates.get(tabId);
-    if (state?.status === "capturing") return;
-    await attachTab(tabId, false);
+    if (await this.isAttached(tabId)) return;
+    await attachTab(tabId, true);
   },
   createTab(url?: string): Promise<chrome.tabs.Tab> {
     return chrome.tabs.create({ url, active: true });
@@ -1054,7 +1058,6 @@ async function markUnexpectedDetach(tabId: number, reason: string): Promise<void
     at: new Date().toISOString(),
     reason: `debugger detached: ${reason}${lost > 0 ? `; ${lost} in-flight item(s) lost` : ""}`
   };
-  await enqueueCaptureGap(Math.max(1, lost), gap.reason, gap.at);
   tabStates.set(tabId, {
     ...state,
     status: "detached",
@@ -1063,6 +1066,7 @@ async function markUnexpectedDetach(tabId: number, reason: string): Promise<void
   });
   pendingRequests.delete(tabId);
   pendingSockets.delete(tabId);
+  await enqueueCaptureGap(lost, gap.reason, gap.at);
   await persistTabs();
   await chrome.action.setBadgeBackgroundColor({ tabId, color: "#a64b3c" }).catch(() => undefined);
   await chrome.action.setBadgeText({ tabId, text: "!" }).catch(() => undefined);
@@ -1076,7 +1080,6 @@ async function closeRemovedTab(tabId: number): Promise<void> {
     at: new Date().toISOString(),
     reason: `tab closed${lost > 0 ? ` with ${lost} in-flight item(s)` : ""}`
   };
-  await enqueueCaptureGap(Math.max(1, lost), gap.reason, gap.at);
   tabStates.set(tabId, {
     ...state,
     status: "detached",
@@ -1085,6 +1088,7 @@ async function closeRemovedTab(tabId: number): Promise<void> {
   });
   pendingRequests.delete(tabId);
   pendingSockets.delete(tabId);
+  await enqueueCaptureGap(lost, gap.reason, gap.at);
   await persistTabs();
 }
 

@@ -2,6 +2,7 @@ import type { ExtensionAutomationCommand, ExtensionAutomationResult } from "./pr
 
 export interface ChromiumAutomationApi {
   attachedTabs(): Promise<chrome.tabs.Tab[]>;
+  isAttached(tabId: number): Promise<boolean>;
   ensureAttached(tabId: number): Promise<void>;
   createTab(url?: string): Promise<chrome.tabs.Tab>;
   getTab(tabId: number): Promise<chrome.tabs.Tab>;
@@ -63,17 +64,35 @@ async function execute(
 
   if (command.operation === "open") {
     const reuse = input.reuseExistingTab !== false && command.tabId !== undefined;
-    const url = optionalString(input.url) ?? "about:blank";
+    const url = optionalString(input.url);
     const tab = reuse
-      ? await api.updateTab(command.tabId!, { url, active: input.open !== false })
-      : await api.createTab(url);
+      ? await api.updateTab(command.tabId!, {
+          ...(url ? { url } : {}),
+          active: input.open !== false
+        })
+      : await api.createTab("about:blank");
     if (tab.id === undefined) throw new Error("browser did not return a tab id");
     await api.ensureAttached(tab.id);
+    if (!reuse && url && url !== "about:blank") {
+      await api.updateTab(tab.id, { url, active: input.open !== false });
+    }
     await waitForReadiness(tab.id, api, "load", command.timeoutMs);
     return status(tab.id, api);
   }
 
   const tabId = requiredTabId(command);
+  if (command.operation === "navigate") {
+    const url = requiredString(input.url, "url");
+    await api.updateTab(tabId, { url });
+    await api.ensureAttached(tabId);
+    await waitForReadiness(
+      tabId,
+      api,
+      optionalString(input.readiness) ?? "load",
+      optionalNumber(input.timeoutMs) ?? command.timeoutMs
+    );
+    return status(tabId, api);
+  }
   await api.ensureAttached(tabId);
   switch (command.operation) {
     case "status":
@@ -81,17 +100,6 @@ async function execute(
     case "tabClose":
       await api.closeTab(tabId);
       return { closedTabId: tabId, tabId: null };
-    case "navigate": {
-      const url = requiredString(input.url, "url");
-      await api.updateTab(tabId, { url });
-      await waitForReadiness(
-        tabId,
-        api,
-        optionalString(input.readiness) ?? "load",
-        optionalNumber(input.timeoutMs) ?? command.timeoutMs
-      );
-      return status(tabId, api);
-    }
     case "back":
       await navigateHistory(tabId, api, -1);
       await waitForReadiness(tabId, api, "load", command.timeoutMs);
