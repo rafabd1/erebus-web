@@ -1,50 +1,19 @@
 import type { ExtensionState, PopupRequest, PopupResponse } from "./protocol";
-import { parsePairingRecord } from "./pairing-record";
 
-const pairingRecord = textarea("pairing-record");
-const serverUrl = input("server-url");
-const token = input("token");
-const sessionId = input("session-id");
 const connection = element("connection");
 const tabStatus = element("tab-status");
 const tabDetail = element("tab-detail");
 const queued = element("queued");
 const failed = element("failed");
 const error = element("error");
-const pairingLock = element("pairing-lock");
 let latestState: ExtensionState | undefined;
 const buttons = {
-  importPairing: button("import-pairing"),
-  save: button("save"),
-  start: button("start"),
-  stop: button("stop"),
+  reconnect: button("reconnect"),
   flush: button("flush"),
   discard: button("discard")
 };
 
-buttons.importPairing.addEventListener("click", () => {
-  hideError();
-  try {
-    const record = parsePairingRecord(pairingRecord.value);
-    serverUrl.value = record.serverUrl;
-    token.value = record.token;
-    sessionId.value = record.sessionId;
-    void run({ type: "saveConfig", ...record });
-  } catch (cause) {
-    showError(message(cause));
-  }
-});
-
-buttons.save.addEventListener("click", () =>
-  run({
-    type: "saveConfig",
-    serverUrl: serverUrl.value,
-    token: token.value,
-    sessionId: sessionId.value
-  })
-);
-buttons.start.addEventListener("click", () => run({ type: "startCurrentTab" }));
-buttons.stop.addEventListener("click", () => run({ type: "stopCurrentTab" }));
+buttons.reconnect.addEventListener("click", () => run({ type: "reconnect" }));
 buttons.flush.addEventListener("click", () => run({ type: "flushNow" }));
 buttons.discard.addEventListener("click", () => {
   if (window.confirm("Discard every queued capture event? This cannot be undone.")) {
@@ -59,11 +28,6 @@ async function load(): Promise<void> {
   try {
     const response = await send({ type: "getState" });
     if (!response.ok) throw new Error(response.error);
-    if (response.config) {
-      serverUrl.value = response.config.serverUrl;
-      token.value = response.config.token;
-      sessionId.value = response.config.sessionId;
-    }
     render(response.state);
   } catch (cause) {
     showError(message(cause));
@@ -88,23 +52,20 @@ async function run(request: PopupRequest): Promise<void> {
 
 function render(state: ExtensionState): void {
   latestState = state;
-  connection.textContent = state.configured ? "Paired" : "Not paired";
+  connection.textContent = state.configured
+    ? state.automationConnected
+      ? "Paired · agent online"
+      : "Paired · waiting"
+    : "Not paired";
   connection.classList.toggle("connected", state.configured);
   queued.textContent = String(state.queued);
   failed.textContent = String(state.deadLetters);
   buttons.discard.disabled = state.queued === 0;
-  sessionId.disabled = state.pairingLocked;
-  pairingLock.hidden = !state.pairingLocked;
-  pairingLock.textContent = state.pairingLocked
-    ? "The capture session stays locked while capture is active or events are queued. Runtime address and token can still be updated."
-    : "";
-
   const active = state.tabs.find((tab) => tab.status === "capturing") ?? state.tabs[0];
   if (!active) {
     tabStatus.textContent = "Idle";
     tabStatus.className = "status";
-    tabDetail.textContent = "No selected tab is being captured.";
-    buttons.stop.disabled = true;
+    tabDetail.textContent = "No tab is controlled by Erebus.";
   } else {
     tabStatus.textContent = active.status;
     tabStatus.className = `status ${active.status}`;
@@ -116,7 +77,6 @@ function render(state: ExtensionState): void {
     ]
       .filter(Boolean)
       .join(" · ");
-    buttons.stop.disabled = false;
   }
 
   if (state.lastFlushError) showError(state.lastFlushError);
@@ -133,10 +93,7 @@ function setBusy(busy: boolean): void {
   }
   for (const control of Object.values(buttons)) control.disabled = false;
   if (latestState) {
-    const active = latestState.tabs.find((tab) => tab.status === "capturing") ?? latestState.tabs[0];
-    buttons.stop.disabled = !active;
     buttons.discard.disabled = latestState.queued === 0;
-    sessionId.disabled = latestState.pairingLocked;
   }
 }
 
@@ -148,14 +105,6 @@ function showError(value: string): void {
 function hideError(): void {
   error.hidden = true;
   error.textContent = "";
-}
-
-function input(id: string): HTMLInputElement {
-  return document.getElementById(id) as HTMLInputElement;
-}
-
-function textarea(id: string): HTMLTextAreaElement {
-  return document.getElementById(id) as HTMLTextAreaElement;
 }
 
 function button(id: string): HTMLButtonElement {

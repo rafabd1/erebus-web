@@ -1,10 +1,14 @@
 import { bodyFromCdp, normalizeHeaders, unavailableBody } from "./normalization";
 import { applyExtraInfo } from "./extra-info";
+import { executeChromiumAutomationCommand } from "./automation";
+import { configFromBootstrap, discoverErebus } from "./bootstrap";
 import type {
   CapturedBody,
   CapturedResponse,
   CaptureGapEvent,
   ExtensionState,
+  ExtensionAutomationCommand,
+  ExtensionAutomationResult,
   HttpCaptureEvent,
   IngestResult,
   PopupRequest,
@@ -34,6 +38,7 @@ import {
   enqueue,
   loadConfig,
   loadLastFlushError,
+  loadOrCreateInstallId,
   loadTabStates,
   pruneStorage,
   queueUsage,
@@ -53,6 +58,9 @@ const MAX_QUEUE_BYTES = 256 * 1024 * 1024;
 const MAX_DEAD_LETTERS = 200;
 const MAX_GAPS_PER_TAB = 20;
 const EXTRA_INFO_GRACE_MS = 35;
+const AUTOMATION_POLL_MS = 20_000;
+const AUTOMATION_RETRY_MS = 1_500;
+const AUTOMATIC_PAIRING_RETRY_MS = 5_000;
 
 interface PendingRequest {
   requestId: string;
@@ -101,13 +109,22 @@ let queuedBytesEstimate = 0;
 let queueUsageReady = false;
 let flushRequested = false;
 let activeDeliveryController: AbortController | undefined;
+let automationConnected = false;
+let automationGeneration = 0;
+let automationController: AbortController | undefined;
+let automaticPairingAttemptAt = 0;
+const activeRecordings = new Map<number, { startedAt: string }>();
+let offscreenCreation: Promise<void> | undefined;
 
 void initialize();
 
 chrome.runtime.onInstalled.addListener(() => void initialize());
 chrome.runtime.onStartup.addListener(() => void initialize());
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === FLUSH_ALARM || alarm.name === FLUSH_SOON_ALARM) void flushAll();
+  if (alarm.name === FLUSH_ALARM || alarm.name === FLUSH_SOON_ALARM) {
+    void flushAll();
+    void ensureAutomaticPairing().then(() => ensureAutomationLoop());
+  }
 });
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
@@ -141,6 +158,7 @@ async function initialize(): Promise<void> {
   const [savedTabs] = await Promise.all([loadTabStates(), chrome.alarms.clear(FLUSH_ALARM)]);
   tabStates = new Map(savedTabs.map((state) => [state.tabId, state]));
   await refreshQueueUsage();
+  await ensureAutomaticPairing();
   await chrome.alarms.create(FLUSH_ALARM, { periodInMinutes: 0.5 });
   for (const state of savedTabs) {
     if (state.status === "capturing" || state.status === "attaching") {
@@ -153,6 +171,7 @@ async function initialize(): Promise<void> {
     }
   }
   await flushAll();
+  void ensureAutomationLoop();
 }
 
 async function handlePopupMessage(message: PopupRequest): Promise<PopupResponse> {
@@ -168,7 +187,9 @@ async function handlePopupMessage(message: PopupRequest): Promise<PopupResponse>
                 serverUrl: config.serverUrl,
                 token: config.token,
                 sessionId: config.sessionId,
-                producerId: config.producerId
+                producerId: config.producerId,
+                ...(config.proxyUrl ? { proxyUrl: config.proxyUrl } : {}),
+                ...(config.caPem ? { caPem: config.caPem } : {})
               }
             }
           : {})
@@ -179,6 +200,8 @@ async function handlePopupMessage(message: PopupRequest): Promise<PopupResponse>
       const serverUrl = normalizeServerUrl(message.serverUrl);
       const token = message.token.trim();
       const sessionId = message.sessionId.trim();
+      const proxyUrl = message.proxyUrl?.trim() || undefined;
+      const caPem = message.caPem?.trim() || undefined;
       if (!token || !sessionId) throw new Error("token and capture session are required");
       const counts = await queueCounts();
       const locked = counts.queued > 0 || hasActiveCapture();
@@ -194,13 +217,18 @@ async function handlePopupMessage(message: PopupRequest): Promise<PopupResponse>
           throw new Error(pairingError);
         }
         return {
-          config: reboundConfig(latest, { serverUrl, token, sessionId }, () => crypto.randomUUID()),
+          config: reboundConfig(
+            latest,
+            { serverUrl, token, sessionId, ...(proxyUrl ? { proxyUrl } : {}), ...(caPem ? { caPem } : {}) },
+            () => crypto.randomUUID()
+          ),
           result: latest
         };
       });
       if (previous && (previous.serverUrl !== serverUrl || previous.token !== token)) {
         activeDeliveryController?.abort();
       }
+      restartAutomationLoop();
       await saveLastFlushError();
       await flushAll();
       return { ok: true, state: await currentState() };
@@ -213,6 +241,11 @@ async function handlePopupMessage(message: PopupRequest): Promise<PopupResponse>
     case "stopCurrentTab": {
       const tab = await activeTab();
       await stopTab(tab.id!);
+      return { ok: true, state: await currentState() };
+    }
+    case "reconnect": {
+      await ensureAutomaticPairing(true);
+      restartAutomationLoop();
       return { ok: true, state: await currentState() };
     }
     case "flushNow": {
@@ -235,7 +268,10 @@ async function attachTab(tabId: number, restoring: boolean): Promise<void> {
   const config = await requireConfig();
   void config;
   const tab = await chrome.tabs.get(tabId);
-  if (!tab.url || !/^https?:/i.test(tab.url)) throw new Error("select an HTTP or HTTPS tab");
+  const targetUrl = tab.url || tab.pendingUrl;
+  if (!targetUrl || (!/^https?:/i.test(targetUrl) && targetUrl !== "about:blank")) {
+    throw new Error("select an HTTP, HTTPS, or blank tab");
+  }
 
   const previous = tabStates.get(tabId);
   tabStates.set(tabId, {
@@ -260,6 +296,9 @@ async function attachTab(tabId: number, restoring: boolean): Promise<void> {
     maxResourceBufferSize: 2 * 1024 * 1024,
     maxTotalBufferSize: 16 * 1024 * 1024
   });
+  if (activeRecordings.has(tabId)) {
+    await startTabScreencast(tabId);
+  }
 
   pendingRequests.set(tabId, new Map());
   pendingSockets.set(tabId, new Map());
@@ -268,6 +307,9 @@ async function attachTab(tabId: number, restoring: boolean): Promise<void> {
   await persistTabs();
   await chrome.action.setBadgeBackgroundColor({ tabId, color: "#1f8f5f" });
   await chrome.action.setBadgeText({ tabId, text: "REC" });
+  await chrome.action
+    .setTitle({ tabId, title: "Erebus is controlling and capturing this tab" })
+    .catch(() => undefined);
 }
 
 async function stopTab(tabId: number): Promise<void> {
@@ -285,6 +327,7 @@ async function stopTab(tabId: number): Promise<void> {
   }
   pendingRequests.delete(tabId);
   pendingSockets.delete(tabId);
+  await discardTabRecording(tabId);
   await persistTabs();
   try {
     intentionalDetaches.add(tabId);
@@ -295,6 +338,7 @@ async function stopTab(tabId: number): Promise<void> {
     // The tab may already be closed or detached by DevTools.
   }
   await chrome.action.setBadgeText({ tabId, text: "" }).catch(() => undefined);
+  await chrome.action.setTitle({ tabId, title: "Erebus Web Capture" }).catch(() => undefined);
 }
 
 async function handleDebuggerEvent(
@@ -303,6 +347,9 @@ async function handleDebuggerEvent(
   params: Record<string, unknown>
 ): Promise<void> {
   switch (method) {
+    case "Page.screencastFrame":
+      await onScreencastFrame(tabId, params);
+      break;
     case "Network.requestWillBeSent":
       await onRequestWillBeSent(tabId, params);
       break;
@@ -841,8 +888,273 @@ async function currentState(): Promise<ExtensionState> {
     tabs: [...tabStates.values()].sort((a, b) => a.tabId - b.tabId),
     ...counts,
     pairingLocked: counts.queued > 0 || hasActiveCapture(),
+    automationConnected,
     ...(lastFlushError ? { lastFlushError } : {})
   };
+}
+
+async function ensureAutomationLoop(): Promise<void> {
+  if (automationController) return;
+  const generation = ++automationGeneration;
+  const controller = new AbortController();
+  automationController = controller;
+  try {
+    await runAutomationLoop(generation, controller.signal);
+  } finally {
+    if (automationGeneration === generation) {
+      automationController = undefined;
+      automationConnected = false;
+    }
+  }
+}
+
+function restartAutomationLoop(): void {
+  automationGeneration += 1;
+  automationConnected = false;
+  automationController?.abort();
+  automationController = undefined;
+  void ensureAutomationLoop();
+}
+
+async function runAutomationLoop(generation: number, signal: AbortSignal): Promise<void> {
+  while (!signal.aborted && automationGeneration === generation) {
+    const config = await loadConfig();
+    if (!config) return;
+    try {
+      await pairingRequest(config, "/v1/extension/heartbeat", {
+        sessionId: config.sessionId,
+        producerId: config.producerId,
+        browser: "chromium",
+        version: chrome.runtime.getManifest().version,
+        tabs: await automationTabs()
+      }, signal);
+      automationConnected = true;
+      const command = await pairingRequest<ExtensionAutomationCommand | null>(
+        config,
+        "/v1/extension/commands/poll",
+        {
+          sessionId: config.sessionId,
+          producerId: config.producerId,
+          waitMs: AUTOMATION_POLL_MS
+        },
+        signal
+      );
+      if (!command) continue;
+      const result = await executeChromiumAutomationCommand(command, chromiumAutomationApi);
+      await submitAutomationResult(config, result, signal);
+    } catch (error) {
+      if (signal.aborted || automationGeneration !== generation) return;
+      automationConnected = false;
+      await ensureAutomaticPairing(true).catch(() => undefined);
+      await delay(AUTOMATION_RETRY_MS);
+    }
+  }
+}
+
+const chromiumAutomationApi = {
+  async attachedTabs(): Promise<chrome.tabs.Tab[]> {
+    return chrome.tabs.query({});
+  },
+  async ensureAttached(tabId: number): Promise<void> {
+    if (tabStates.get(tabId)?.status === "capturing") return;
+    await attachTab(tabId, true);
+  },
+  createTab(url?: string): Promise<chrome.tabs.Tab> {
+    return chrome.tabs.create({ url, active: true });
+  },
+  getTab(tabId: number): Promise<chrome.tabs.Tab> {
+    return chrome.tabs.get(tabId);
+  },
+  async updateTab(tabId: number, update: chrome.tabs.UpdateProperties): Promise<chrome.tabs.Tab> {
+    const tab = await chrome.tabs.update(tabId, update);
+    if (!tab) throw new Error("browser did not return the updated tab");
+    return tab;
+  },
+  async closeTab(tabId: number): Promise<void> {
+    await chrome.tabs.remove(tabId);
+  },
+  startRecording: startTabRecording,
+  stopRecording: stopTabRecording,
+  sendCommand
+};
+
+async function startTabRecording(tabId: number): Promise<{ startedAt: string }> {
+  const current = activeRecordings.get(tabId);
+  if (current) return current;
+  await ensureOffscreenDocument();
+  const response = await sendOffscreenMessage<{ startedAt: string }>({
+    type: "erebus-recording-start",
+    tabId
+  });
+  const recording = { startedAt: response.startedAt };
+  activeRecordings.set(tabId, recording);
+  try {
+    await startTabScreencast(tabId);
+    return recording;
+  } catch (error) {
+    activeRecordings.delete(tabId);
+    await sendOffscreenMessage({ type: "erebus-recording-discard", tabId }).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function stopTabRecording(tabId: number): Promise<{
+  startedAt: string;
+  mimeType: string;
+  dataBase64: string;
+}> {
+  if (!activeRecordings.has(tabId)) throw new Error("browser recording is not active for this tab");
+  await sendCommand(tabId, "Page.stopScreencast").catch(() => undefined);
+  try {
+    return await sendOffscreenMessage({ type: "erebus-recording-stop", tabId });
+  } finally {
+    activeRecordings.delete(tabId);
+  }
+}
+
+async function discardTabRecording(tabId: number): Promise<void> {
+  if (!activeRecordings.delete(tabId)) return;
+  await sendCommand(tabId, "Page.stopScreencast").catch(() => undefined);
+  await ensureOffscreenDocument().catch(() => undefined);
+  await sendOffscreenMessage({ type: "erebus-recording-discard", tabId }).catch(() => undefined);
+}
+
+async function startTabScreencast(tabId: number): Promise<void> {
+  await sendCommand(tabId, "Page.startScreencast", {
+    format: "jpeg",
+    quality: 80,
+    everyNthFrame: 1
+  });
+}
+
+async function onScreencastFrame(
+  tabId: number,
+  params: Record<string, unknown>
+): Promise<void> {
+  const sessionId = params.sessionId;
+  if (typeof sessionId !== "number") return;
+  try {
+    if (activeRecordings.has(tabId) && typeof params.data === "string") {
+      await sendOffscreenMessage({
+        type: "erebus-recording-frame",
+        tabId,
+        data: params.data
+      });
+    }
+  } finally {
+    await sendCommand(tabId, "Page.screencastFrameAck", { sessionId }).catch(() => undefined);
+  }
+}
+
+async function ensureOffscreenDocument(): Promise<void> {
+  if (offscreenCreation) return offscreenCreation;
+  offscreenCreation = (async () => {
+    const documentUrl = chrome.runtime.getURL("offscreen.html");
+    const contexts = await chrome.runtime.getContexts({
+      contextTypes: [chrome.runtime.ContextType.OFFSCREEN_DOCUMENT],
+      documentUrls: [documentUrl]
+    });
+    if (contexts.length > 0) return;
+    await chrome.offscreen.createDocument({
+      url: "offscreen.html",
+      reasons: [chrome.offscreen.Reason.USER_MEDIA],
+      justification: "Encode agent-requested browser tab recordings from DevTools screencast frames."
+    });
+  })();
+  try {
+    await offscreenCreation;
+  } finally {
+    offscreenCreation = undefined;
+  }
+}
+
+async function sendOffscreenMessage<T = unknown>(message: Record<string, unknown>): Promise<T> {
+  const response = (await chrome.runtime.sendMessage(message)) as
+    | { ok: true; result: T }
+    | { ok: false; error: string }
+    | undefined;
+  if (!response) throw new Error("browser recording worker did not respond");
+  if (!response.ok) throw new Error(response.error);
+  return response.result;
+}
+
+async function automationTabs(): Promise<import("./protocol").ExtensionAutomationTab[]> {
+  const tabs = await chromiumAutomationApi.attachedTabs();
+  return tabs.flatMap((tab) =>
+    tab.id === undefined || tab.windowId === undefined
+      ? []
+      : [{
+          tabId: tab.id,
+          windowId: tab.windowId,
+          active: tab.active,
+          attached:
+            tabStates.get(tab.id)?.status === "capturing" ||
+            tabStates.get(tab.id)?.status === "attaching",
+          ...(tab.title ? { title: tab.title } : {}),
+          ...(tab.url ? { url: tab.url } : {}),
+          ...(tab.status ? { status: tab.status } : {})
+        }]
+  );
+}
+
+async function ensureAutomaticPairing(force = false): Promise<RuntimeConfig | undefined> {
+  const previous = await loadConfig();
+  if (previous && !force) return previous;
+  const now = Date.now();
+  if (now - automaticPairingAttemptAt < AUTOMATIC_PAIRING_RETRY_MS) return previous;
+  automaticPairingAttemptAt = now;
+  const installId = await loadOrCreateInstallId();
+  const record = await discoverErebus(
+    installId,
+    "chromium",
+    chrome.runtime.getManifest().version
+  );
+  if (!record) return previous;
+  const next = configFromBootstrap(record, installId, previous);
+  await saveConfig(next);
+  if (
+    previous &&
+    (previous.serverUrl !== next.serverUrl || previous.token !== next.token)
+  ) {
+    activeDeliveryController?.abort();
+  }
+  return next;
+}
+
+async function submitAutomationResult(
+  config: RuntimeConfig,
+  result: ExtensionAutomationResult,
+  signal: AbortSignal
+): Promise<void> {
+  await pairingRequest(
+    config,
+    "/v1/extension/commands/result",
+    { sessionId: config.sessionId, producerId: config.producerId, ...result },
+    signal
+  );
+}
+
+async function pairingRequest<T = unknown>(
+  config: RuntimeConfig,
+  path: string,
+  body: unknown,
+  signal: AbortSignal
+): Promise<T> {
+  const response = await fetch(`${config.serverUrl}${path}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${config.token}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body),
+    signal
+  });
+  if (!response.ok) {
+    const detail = (await response.text()).trim();
+    throw new Error(detail || `Erebus runtime returned HTTP ${response.status}`);
+  }
+  if (response.status === 204) return undefined as T;
+  return (await response.json()) as T;
 }
 
 async function markUnexpectedDetach(tabId: number, reason: string): Promise<void> {
@@ -853,7 +1165,6 @@ async function markUnexpectedDetach(tabId: number, reason: string): Promise<void
     at: new Date().toISOString(),
     reason: `debugger detached: ${reason}${lost > 0 ? `; ${lost} in-flight item(s) lost` : ""}`
   };
-  await enqueueCaptureGap(Math.max(1, lost), gap.reason, gap.at);
   tabStates.set(tabId, {
     ...state,
     status: "detached",
@@ -862,6 +1173,7 @@ async function markUnexpectedDetach(tabId: number, reason: string): Promise<void
   });
   pendingRequests.delete(tabId);
   pendingSockets.delete(tabId);
+  await enqueueCaptureGap(lost, gap.reason, gap.at);
   await persistTabs();
   await chrome.action.setBadgeBackgroundColor({ tabId, color: "#a64b3c" }).catch(() => undefined);
   await chrome.action.setBadgeText({ tabId, text: "!" }).catch(() => undefined);
@@ -875,7 +1187,6 @@ async function closeRemovedTab(tabId: number): Promise<void> {
     at: new Date().toISOString(),
     reason: `tab closed${lost > 0 ? ` with ${lost} in-flight item(s)` : ""}`
   };
-  await enqueueCaptureGap(Math.max(1, lost), gap.reason, gap.at);
   tabStates.set(tabId, {
     ...state,
     status: "detached",
@@ -884,6 +1195,8 @@ async function closeRemovedTab(tabId: number): Promise<void> {
   });
   pendingRequests.delete(tabId);
   pendingSockets.delete(tabId);
+  await discardTabRecording(tabId);
+  await enqueueCaptureGap(lost, gap.reason, gap.at);
   await persistTabs();
 }
 

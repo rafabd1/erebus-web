@@ -1,4 +1,5 @@
 mod api;
+mod automation;
 mod blob;
 mod capture;
 mod config;

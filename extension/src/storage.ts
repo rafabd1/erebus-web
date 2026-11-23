@@ -7,6 +7,7 @@ const DEAD_STORE = "deadLetters";
 const CONFIG_KEY = "runtimeConfig";
 const TABS_KEY = "captureTabs";
 const FLUSH_ERROR_KEY = "lastFlushError";
+const INSTALL_ID_KEY = "installId";
 
 export interface PruneResult {
   dropped: QueueItem[];
@@ -215,6 +216,15 @@ export async function loadConfig(): Promise<RuntimeConfig | undefined> {
 
 export async function saveConfig(config: RuntimeConfig): Promise<void> {
   await chrome.storage.local.set({ [CONFIG_KEY]: config });
+}
+
+export async function loadOrCreateInstallId(): Promise<string> {
+  const result = await chrome.storage.local.get(INSTALL_ID_KEY);
+  const existing = result[INSTALL_ID_KEY];
+  if (typeof existing === "string" && existing.length >= 8) return existing;
+  const installId = crypto.randomUUID();
+  await chrome.storage.local.set({ [INSTALL_ID_KEY]: installId });
+  return installId;
 }
 
 export async function loadTabStates(): Promise<TabCaptureState[]> {

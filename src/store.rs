@@ -51,6 +51,11 @@ pub struct Store {
     fts_enabled: bool,
 }
 
+pub struct ExtensionPairings {
+    pub active: Vec<(String, String)>,
+    pub revoked: Vec<String>,
+}
+
 #[derive(Debug)]
 struct DecodedBody {
     bytes: Option<Vec<u8>>,
@@ -92,6 +97,7 @@ impl Store {
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=FULL;
+             PRAGMA wal_autocheckpoint=64;
              PRAGMA foreign_keys=ON;
              PRAGMA auto_vacuum=INCREMENTAL;",
         )?;
@@ -229,31 +235,142 @@ impl Store {
             .map_err(Into::into)
     }
 
-    pub fn end_session(&self, id: &str) -> anyhow::Result<Option<CaptureSession>> {
-        let connection = self.writer()?;
-        let ended_at = now();
-        connection.execute(
-            "UPDATE capture_sessions SET ended_at = COALESCE(ended_at, ?2) WHERE id = ?1",
-            params![id, ended_at],
+    pub fn extension_pairings(&self) -> anyhow::Result<ExtensionPairings> {
+        let connection = self.reader()?;
+        let mut statement = connection.prepare(
+            "SELECT pairing.token_hash, pairing.session_id,
+                    CASE
+                        WHEN pairing.revoked = 1
+                          OR session.id IS NULL
+                          OR session.ended_at IS NOT NULL
+                        THEN 1 ELSE 0
+                    END AS is_revoked
+             FROM extension_pairings AS pairing
+             LEFT JOIN capture_sessions AS session ON session.id = pairing.session_id
+             ORDER BY pairing.created_at ASC",
         )?;
-        connection
-            .query_row(
-                "SELECT id, label, source, started_at, ended_at, scope_profile_id
-                 FROM capture_sessions WHERE id = ?1",
-                [id],
-                |row| {
-                    Ok(CaptureSession {
-                        id: row.get(0)?,
-                        label: row.get(1)?,
-                        source: row.get(2)?,
-                        started_at: row.get(3)?,
-                        ended_at: row.get(4)?,
-                        scope_profile_id: row.get(5)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(Into::into)
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
+        })?;
+        let mut active = Vec::new();
+        let mut revoked = Vec::new();
+        for row in rows {
+            let (token_hash, session_id, is_revoked) = row?;
+            if is_revoked {
+                revoked.push(token_hash);
+            } else {
+                active.push((token_hash, session_id));
+            }
+        }
+        Ok(ExtensionPairings { active, revoked })
+    }
+
+    pub fn replace_extension_pairing(
+        &self,
+        session_id: &str,
+        token_hash: &str,
+    ) -> anyhow::Result<()> {
+        let mut connection = self.writer()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM extension_pairings WHERE session_id = ?1",
+            [session_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO extension_pairings(token_hash, session_id, revoked, created_at)
+             VALUES (?1, ?2, 0, ?3)",
+            params![token_hash, session_id, now()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn revoke_extension_pairing(
+        &self,
+        session_id: &str,
+        max_revoked: usize,
+    ) -> anyhow::Result<()> {
+        let mut connection = self.writer()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "UPDATE extension_pairings
+             SET revoked = 1, revoked_at = COALESCE(revoked_at, ?2)
+             WHERE session_id = ?1 AND revoked = 0",
+            params![session_id, now()],
+        )?;
+        transaction.execute(
+            "DELETE FROM extension_pairings
+             WHERE revoked = 1
+               AND token_hash NOT IN (
+                   SELECT token_hash FROM extension_pairings
+                   WHERE revoked = 1
+                   ORDER BY revoked_at DESC, created_at DESC
+                   LIMIT ?1
+               )",
+            [i64::try_from(max_revoked)?],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn end_session(&self, id: &str) -> anyhow::Result<Option<CaptureSession>> {
+        let session = {
+            let connection = self.writer()?;
+            let ended_at = now();
+            connection.execute(
+                "UPDATE capture_sessions SET ended_at = COALESCE(ended_at, ?2) WHERE id = ?1",
+                params![id, ended_at],
+            )?;
+            connection
+                .query_row(
+                    "SELECT id, label, source, started_at, ended_at, scope_profile_id
+                     FROM capture_sessions WHERE id = ?1",
+                    [id],
+                    |row| {
+                        Ok(CaptureSession {
+                            id: row.get(0)?,
+                            label: row.get(1)?,
+                            source: row.get(2)?,
+                            started_at: row.get(3)?,
+                            ended_at: row.get(4)?,
+                            scope_profile_id: row.get(5)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(anyhow::Error::from)?
+        };
+        let checkpoint_result = Connection::open(&self.database_path).and_then(|checkpoint| {
+            checkpoint.busy_timeout(std::time::Duration::from_secs(5))?;
+            checkpoint.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+        });
+        match checkpoint_result {
+            Ok((0, _, _)) => {}
+            Ok((_, log_frames, checkpointed_frames)) => tracing::warn!(
+                %id,
+                log_frames,
+                checkpointed_frames,
+                "capture ended but the workspace database checkpoint is still busy"
+            ),
+            Err(error) => tracing::warn!(
+                %error,
+                %id,
+                "capture ended but the workspace database checkpoint was deferred"
+            ),
+        }
+        Ok(session)
     }
 
     pub fn delete_session(&self, id: &str) -> anyhow::Result<Option<SessionDeleteResult>> {
@@ -3218,6 +3335,44 @@ mod tests {
             .unwrap_err();
         assert!(is_input_error(&error));
         assert!(error.to_string().contains("has ended"));
+    }
+
+    #[test]
+    fn ending_a_session_checkpoints_the_workspace_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let session = store
+            .create_session(CreateSession {
+                label: "checkpoint".into(),
+                source: "proxy".into(),
+                scope_profile_id: None,
+            })
+            .unwrap();
+        store
+            .ingest_http(HttpIngestBatch {
+                producer_id: "checkpoint-producer".into(),
+                session_id: session.id.clone(),
+                events: vec![event(
+                    1,
+                    "https://example.com/checkpoint",
+                    "2026-11-20T12:00:00Z",
+                )],
+            })
+            .unwrap();
+
+        store.end_session(&session.id).unwrap();
+
+        let snapshot_path = temp.path().join("traffic-snapshot.sqlite");
+        std::fs::copy(temp.path().join("traffic.sqlite"), &snapshot_path).unwrap();
+        let snapshot = Connection::open(snapshot_path).unwrap();
+        let count: i64 = snapshot
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+                [&session.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]

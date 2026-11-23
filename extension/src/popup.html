@@ -11,48 +11,25 @@
       <header>
         <div>
           <h1>Erebus capture</h1>
-          <p>Capture only the tab you choose.</p>
+          <p>Agent control for this browser.</p>
         </div>
         <span id="connection" class="badge">Not paired</span>
       </header>
 
-      <section class="card" aria-labelledby="pairing-heading">
-        <h2 id="pairing-heading">Runtime</h2>
-        <label>
-          Pairing record
-          <textarea
-            id="pairing-record"
-            placeholder="Paste the record copied from Erebus"
-            spellcheck="false"
-          ></textarea>
-        </label>
-        <button id="import-pairing" type="button" class="secondary">Import record</button>
-        <label>
-          Local URL
-          <input id="server-url" type="url" placeholder="http://127.0.0.1:8789" spellcheck="false" />
-        </label>
-        <label>
-          Token
-          <input id="token" type="password" autocomplete="off" spellcheck="false" />
-        </label>
-        <label>
-          Capture session
-          <input id="session-id" type="text" spellcheck="false" />
-        </label>
-        <button id="save" type="button" class="secondary">Save pairing</button>
-        <p id="pairing-lock" class="detail" hidden></p>
+      <section class="card" aria-labelledby="connection-heading">
+        <div class="section-row">
+          <h2 id="connection-heading">Connection</h2>
+          <button id="reconnect" type="button" class="secondary">Reconnect</button>
+        </div>
+        <p class="detail">Erebus finds this browser automatically while the desktop app is running.</p>
       </section>
 
       <section class="card" aria-labelledby="capture-heading">
         <div class="section-row">
-          <h2 id="capture-heading">Current tab</h2>
+          <h2 id="capture-heading">Agent activity</h2>
           <span id="tab-status" class="status">Idle</span>
         </div>
-        <div class="actions">
-          <button id="start" type="button">Start capture</button>
-          <button id="stop" type="button" class="secondary">Stop</button>
-        </div>
-        <p id="tab-detail" class="detail">No selected tab is being captured.</p>
+        <p id="tab-detail" class="detail">No tab is controlled by Erebus.</p>
       </section>
 
       <section class="queue" aria-live="polite">
