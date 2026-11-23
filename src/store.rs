@@ -349,7 +349,11 @@ impl Store {
         let checkpoint_result = Connection::open(&self.database_path).and_then(|checkpoint| {
             checkpoint.busy_timeout(std::time::Duration::from_secs(5))?;
             checkpoint.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
             })
         });
         match checkpoint_result {
