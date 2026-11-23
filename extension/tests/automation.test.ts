@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   executeChromiumAutomationCommand,
   implicitInputRole,
+  roleLocatorExpression,
   type ChromiumAutomationApi
 } from "../src/automation";
 
@@ -78,6 +79,14 @@ describe("extension automation navigation", () => {
     expect(implicitInputRole("search")).toBe("searchbox");
     expect(implicitInputRole("text")).toBe("textbox");
     expect(implicitInputRole("hidden")).toBeNull();
+  });
+
+  it("matches role locators by their associated label", () => {
+    const expression = roleLocatorExpression("radio", "Medium");
+
+    expect(expression).toContain("input[type='radio']");
+    expect(expression).toContain("el.labels");
+    expect(expression).toContain('nameOf(el) === "Medium"');
   });
 
   it("attaches a new blank tab before navigating to the requested URL", async () => {
