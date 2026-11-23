@@ -1,7 +1,7 @@
 import { bodyFromCdp, normalizeHeaders, unavailableBody } from "./normalization";
 import { applyExtraInfo } from "./extra-info";
 import { executeChromiumAutomationCommand } from "./automation";
-import { configFromBootstrap, discoverErebus } from "./bootstrap";
+import { configFromBootstrap, discoverErebuses } from "./bootstrap";
 import type {
   CapturedBody,
   CapturedResponse,
@@ -36,14 +36,14 @@ import {
   deadLetterTarget,
   dueItems,
   enqueue,
-  loadConfig,
+  loadConfigs,
   loadLastFlushError,
   loadOrCreateInstallId,
   loadTabStates,
   pruneStorage,
   queueUsage,
   queueCounts,
-  saveConfig,
+  saveConfigs,
   saveLastFlushError,
   saveTabStates
 } from "./storage";
@@ -58,7 +58,7 @@ const MAX_QUEUE_BYTES = 256 * 1024 * 1024;
 const MAX_DEAD_LETTERS = 200;
 const MAX_GAPS_PER_TAB = 20;
 const EXTRA_INFO_GRACE_MS = 35;
-const AUTOMATION_POLL_MS = 20_000;
+const AUTOMATION_POLL_MS = 5_000;
 const AUTOMATION_RETRY_MS = 1_500;
 const AUTOMATIC_PAIRING_RETRY_MS = 5_000;
 
@@ -111,10 +111,12 @@ let flushRequested = false;
 let activeDeliveryController: AbortController | undefined;
 let automationConnected = false;
 let automationGeneration = 0;
-let automationController: AbortController | undefined;
+const automationControllers = new Map<string, AbortController>();
 let automaticPairingAttemptAt = 0;
+let automaticPairingInFlight: Promise<RuntimeConfig | undefined> | undefined;
 const activeRecordings = new Map<number, { startedAt: string }>();
 let offscreenCreation: Promise<void> | undefined;
+const tabCommandChains = new Map<number, Promise<void>>();
 
 void initialize();
 
@@ -167,7 +169,12 @@ async function initialize(): Promise<void> {
         "extension service worker restarted; in-flight requests may be incomplete",
         1
       );
-      await attachTab(state.tabId, true).catch((error) => markTabError(state.tabId, errorMessage(error)));
+      const config = state.target ? await configForTarget(state.target).catch(() => undefined) : await requireConfig().catch(() => undefined);
+      if (!config) {
+        await markTabError(state.tabId, "the capture session that owned this tab is no longer connected");
+        continue;
+      }
+      await attachTab(state.tabId, true, config).catch((error) => markTabError(state.tabId, errorMessage(error)));
     }
   }
   await flushAll();
@@ -177,7 +184,7 @@ async function initialize(): Promise<void> {
 async function handlePopupMessage(message: PopupRequest): Promise<PopupResponse> {
   switch (message.type) {
     case "getState": {
-      const config = await loadConfig();
+      const config = (await loadConfigs())[0];
       return {
         ok: true,
         state: await currentState(),
@@ -196,7 +203,7 @@ async function handlePopupMessage(message: PopupRequest): Promise<PopupResponse>
       };
     }
     case "saveConfig": {
-      const current = await loadConfig();
+      const current = (await loadConfigs())[0];
       const serverUrl = normalizeServerUrl(message.serverUrl);
       const token = message.token.trim();
       const sessionId = message.sessionId.trim();
@@ -212,17 +219,19 @@ async function handlePopupMessage(message: PopupRequest): Promise<PopupResponse>
       if (!pairingChangeAllowed(current, { serverUrl, sessionId }, locked)) {
         throw new Error(pairingError);
       }
-      const previous = await mutateConfig((latest) => {
-        if (!pairingChangeAllowed(latest, { serverUrl, sessionId }, locked)) {
+      const previous = await mutateConfigs((latest) => {
+        const current = latest[0];
+        if (!pairingChangeAllowed(current, { serverUrl, sessionId }, locked)) {
           throw new Error(pairingError);
         }
-        return {
-          config: reboundConfig(
-            latest,
+        const next = reboundConfig(
+            current,
             { serverUrl, token, sessionId, ...(proxyUrl ? { proxyUrl } : {}), ...(caPem ? { caPem } : {}) },
             () => crypto.randomUUID()
-          ),
-          result: latest
+          );
+        return {
+          configs: [next, ...latest.filter((item) => !sameTarget(queueTarget(item), queueTarget(next)))],
+          result: current
         };
       });
       if (previous && (previous.serverUrl !== serverUrl || previous.token !== token)) {
@@ -235,7 +244,7 @@ async function handlePopupMessage(message: PopupRequest): Promise<PopupResponse>
     }
     case "startCurrentTab": {
       const tab = await activeTab();
-      await attachTab(tab.id!, false);
+      await attachTab(tab.id!, false, await requireConfig());
       return { ok: true, state: await currentState() };
     }
     case "stopCurrentTab": {
@@ -264,9 +273,7 @@ async function handlePopupMessage(message: PopupRequest): Promise<PopupResponse>
   }
 }
 
-async function attachTab(tabId: number, restoring: boolean): Promise<void> {
-  const config = await requireConfig();
-  void config;
+async function attachTab(tabId: number, restoring: boolean, config: RuntimeConfig): Promise<void> {
   const tab = await chrome.tabs.get(tabId);
   const targetUrl = tab.url || tab.pendingUrl;
   if (!targetUrl || (!/^https?:/i.test(targetUrl) && targetUrl !== "about:blank")) {
@@ -274,6 +281,10 @@ async function attachTab(tabId: number, restoring: boolean): Promise<void> {
   }
 
   const previous = tabStates.get(tabId);
+  const target = queueTarget(config);
+  if (previous?.target && !sameTarget(previous.target, target)) {
+    throw new Error("This tab is already controlled by another Erebus workspace. Finish or close it before another chat takes control.");
+  }
   tabStates.set(tabId, {
     tabId,
     ...(tab.title ? { title: tab.title } : {}),
@@ -281,7 +292,8 @@ async function attachTab(tabId: number, restoring: boolean): Promise<void> {
     status: "attaching",
     captured: previous?.captured ?? 0,
     gaps: previous?.gaps ?? [],
-    startedAt: previous?.startedAt ?? new Date().toISOString()
+    startedAt: previous?.startedAt ?? new Date().toISOString(),
+    target
   });
   await persistTabs();
 
@@ -507,7 +519,7 @@ async function finalizeRequest(
 ): Promise<void> {
   const requestBody = await readRequestBody(tabId, pending, redirect);
   const responseBody = await readResponseBody(tabId, pending, responseValue, redirect);
-  const { sequence, config } = await reserveSequence();
+  const { sequence, config } = await reserveSequence(requireTabTarget(tabId));
   const response = responseValue ? capturedResponse(responseValue, pending.extraResponse, responseBody) : undefined;
   const state = tabStates.get(tabId);
   const event: HttpCaptureEvent = {
@@ -588,7 +600,7 @@ async function onWebSocketCreated(tabId: number, params: Record<string, unknown>
   if (!requestId || !url) return;
   const sockets = pendingSockets.get(tabId) ?? new Map<string, PendingSocket>();
   pendingSockets.set(tabId, sockets);
-  const config = await requireConfig();
+  const config = await configForTarget(requireTabTarget(tabId));
   sockets.set(requestId, {
     connectionId: `${config.producerId}:${tabId}:${requestId}`,
     url,
@@ -657,7 +669,7 @@ async function enqueueWebSocket(
   tabId: number,
   event: Omit<WebSocketFrameEvent, "sequence" | "capturedAt">
 ): Promise<void> {
-  const { sequence, config } = await reserveSequence();
+  const { sequence, config } = await reserveSequence(requireTabTarget(tabId));
   await enqueueEvent(
     "ws",
     sequence,
@@ -681,7 +693,7 @@ async function enqueueEvent(
 ): Promise<void> {
   const byteSize = new TextEncoder().encode(JSON.stringify(event)).byteLength + 256;
   const item: QueueItem = {
-    id: `${target.producerId}:${sequence}`,
+    id: `${target.serverUrl}:${target.sessionId}:${target.producerId}:${sequence}`,
     kind,
     sequence,
     event,
@@ -728,11 +740,19 @@ async function flushAll(): Promise<void> {
     await enqueueChain;
     const deadline = Date.now() + FLUSH_BUDGET_MS;
     while (Date.now() < deadline) {
-      const config = await loadConfig();
-      if (!config) return;
-      const gap = await flushKind(config, "gap");
-      const http = await flushKind(config, "http");
-      const websocket = await flushKind(config, "ws");
+      const configs = await loadConfigs();
+      if (configs.length === 0) return;
+      let gap = false;
+      let http = false;
+      let websocket = false;
+      // A single delivery controller owns cancellation during re-pairing.
+      // Serial delivery also preserves the order of each target's capture
+      // stream instead of letting concurrent requests race each other.
+      for (const config of configs) {
+        gap = (await flushKind(config, "gap")) || gap;
+        http = (await flushKind(config, "http")) || http;
+        websocket = (await flushKind(config, "ws")) || websocket;
+      }
       if (!gap && !http && !websocket) break;
     }
     if (Date.now() >= deadline) scheduleFlushSoon();
@@ -749,15 +769,12 @@ async function flushAll(): Promise<void> {
 }
 
 async function flushKind(config: RuntimeConfig, kind: QueueKind): Promise<boolean> {
-  const candidates = await dueItems(kind, Date.now(), DUE_CANDIDATES);
+  const candidates = (await dueItems(kind, Date.now(), DUE_CANDIDATES)).filter((item) =>
+    sameTarget(item.target, queueTarget(config))
+  );
   const items = kind === "gap" ? candidates.slice(0, 1) : selectBatch(candidates);
   if (items.length === 0) return false;
   const target = items[0]!.target;
-  if (!sameTarget(target, queueTarget(config))) {
-    throw new Error(
-      "queued capture belongs to a different runtime session; restore that pairing or clear the queue"
-    );
-  }
   const path = deliveryPath(kind);
   const body =
     kind === "http"
@@ -804,7 +821,7 @@ async function flushKind(config: RuntimeConfig, kind: QueueKind): Promise<boolea
     }
     noteQueueRemoval(rejected);
     await recordDiscardedItems(rejected, "capture delivery stopped after a terminal runtime response");
-    if (action === "reject-target") await stopCapturesAfterTerminalResponse(error);
+    if (action === "reject-target") await stopCapturesAfterTerminalResponse(target, error);
     const pruned = await pruneStorage(MAX_QUEUE_ITEMS, MAX_QUEUE_BYTES, MAX_DEAD_LETTERS);
     if (pruned.dropped.length > 0) await recordQueueDrops(pruned.dropped);
     throw new Error(error);
@@ -837,9 +854,12 @@ async function retryItems(items: QueueItem[], minimumDelay = 0): Promise<void> {
   await acknowledge([], [], items, (item) => Date.now() + Math.max(minimumDelay, retryDelay(item.attempts)));
 }
 
-async function stopCapturesAfterTerminalResponse(reason: string): Promise<void> {
+async function stopCapturesAfterTerminalResponse(target: QueueTarget, reason: string): Promise<void> {
   const activeTabs = [...tabStates.values()].filter(
-    (state) => state.status === "attaching" || state.status === "capturing"
+    (state) =>
+      (state.status === "attaching" || state.status === "capturing") &&
+      state.target !== undefined &&
+      sameTarget(state.target, target)
   );
   for (const state of activeTabs) {
     const lost = inFlightCount(state.tabId);
@@ -868,23 +888,27 @@ async function stopCapturesAfterTerminalResponse(reason: string): Promise<void> 
   await persistTabs();
 }
 
-async function reserveSequence(): Promise<{ sequence: number; config: RuntimeConfig }> {
-  return mutateConfig((current) => {
-    if (!current) throw new Error("pair the extension with an Erebus capture session first");
+async function reserveSequence(target: QueueTarget): Promise<{ sequence: number; config: RuntimeConfig }> {
+  return mutateConfigs((configs) => {
+    const index = configs.findIndex((config) => sameTarget(queueTarget(config), target));
+    if (index < 0) throw new Error("the capture session that owns this tab is no longer connected");
+    const current = configs[index]!;
     const sequence = current.nextSequence;
     const config = { ...current, nextSequence: sequence + 1 };
-    return { config, result: { sequence, config } };
+    const next = [...configs];
+    next[index] = config;
+    return { configs: next, result: { sequence, config } };
   });
 }
 
 async function currentState(): Promise<ExtensionState> {
-  const [config, counts, lastFlushError] = await Promise.all([
-    loadConfig(),
+  const [configs, counts, lastFlushError] = await Promise.all([
+    loadConfigs(),
     queueCounts(),
     loadLastFlushError()
   ]);
   return {
-    configured: config !== undefined,
+    configured: configs.length > 0,
     tabs: [...tabStates.values()].sort((a, b) => a.tabId - b.tabId),
     ...counts,
     pairingLocked: counts.queued > 0 || hasActiveCapture(),
@@ -894,32 +918,30 @@ async function currentState(): Promise<ExtensionState> {
 }
 
 async function ensureAutomationLoop(): Promise<void> {
-  if (automationController) return;
-  const generation = ++automationGeneration;
-  const controller = new AbortController();
-  automationController = controller;
-  try {
-    await runAutomationLoop(generation, controller.signal);
-  } finally {
-    if (automationGeneration === generation) {
-      automationController = undefined;
-      automationConnected = false;
-    }
+  const configs = await loadConfigs();
+  for (const config of configs) {
+    const key = runtimeKey(config);
+    if (automationControllers.has(key)) continue;
+    const generation = automationGeneration;
+    const controller = new AbortController();
+    automationControllers.set(key, controller);
+    void runAutomationLoop(config, generation, controller.signal).finally(() => {
+      if (automationControllers.get(key) === controller) automationControllers.delete(key);
+      automationConnected = automationControllers.size > 0;
+    });
   }
 }
 
 function restartAutomationLoop(): void {
   automationGeneration += 1;
   automationConnected = false;
-  automationController?.abort();
-  automationController = undefined;
+  for (const controller of automationControllers.values()) controller.abort();
+  automationControllers.clear();
   void ensureAutomationLoop();
 }
 
-async function runAutomationLoop(generation: number, signal: AbortSignal): Promise<void> {
+async function runAutomationLoop(config: RuntimeConfig, generation: number, signal: AbortSignal): Promise<void> {
   while (!signal.aborted && automationGeneration === generation) {
-    const config = await loadConfig();
-    if (!config) return;
     try {
       await pairingRequest(config, "/v1/extension/heartbeat", {
         sessionId: config.sessionId,
@@ -939,25 +961,30 @@ async function runAutomationLoop(generation: number, signal: AbortSignal): Promi
         },
         signal
       );
-      if (!command) continue;
-      const result = await executeChromiumAutomationCommand(command, chromiumAutomationApi);
+      if (!command) {
+        continue;
+      }
+      const result = await executeSerializedAutomationCommand(config, command);
       await submitAutomationResult(config, result, signal);
     } catch (error) {
       if (signal.aborted || automationGeneration !== generation) return;
       automationConnected = false;
-      await ensureAutomaticPairing(true).catch(() => undefined);
+      await ensureAutomaticPairing().catch(() => undefined);
+      await ensureAutomationLoop();
       await delay(AUTOMATION_RETRY_MS);
     }
   }
 }
 
-const chromiumAutomationApi = {
+function chromiumAutomationApi(config: RuntimeConfig) {
+  return {
   async attachedTabs(): Promise<chrome.tabs.Tab[]> {
     return chrome.tabs.query({});
   },
   async ensureAttached(tabId: number): Promise<void> {
-    if (tabStates.get(tabId)?.status === "capturing") return;
-    await attachTab(tabId, true);
+    const current = tabStates.get(tabId);
+    if (current?.status === "capturing" && current.target && sameTarget(current.target, queueTarget(config))) return;
+    await attachTab(tabId, true, config);
   },
   createTab(url?: string): Promise<chrome.tabs.Tab> {
     return chrome.tabs.create({ url, active: true });
@@ -976,7 +1003,26 @@ const chromiumAutomationApi = {
   startRecording: startTabRecording,
   stopRecording: stopTabRecording,
   sendCommand
-};
+  };
+}
+
+async function executeSerializedAutomationCommand(
+  config: RuntimeConfig,
+  command: ExtensionAutomationCommand
+): Promise<ExtensionAutomationResult> {
+  const tabId = command.tabId;
+  const execute = () => executeChromiumAutomationCommand(command, chromiumAutomationApi(config));
+  if (tabId === undefined) return execute();
+  const previous = tabCommandChains.get(tabId) ?? Promise.resolve();
+  const operation = previous.catch(() => undefined).then(execute);
+  const tail = operation.then(() => undefined, () => undefined);
+  tabCommandChains.set(tabId, tail);
+  try {
+    return await operation;
+  } finally {
+    if (tabCommandChains.get(tabId) === tail) tabCommandChains.delete(tabId);
+  }
+}
 
 async function startTabRecording(tabId: number): Promise<{ startedAt: string }> {
   const current = activeRecordings.get(tabId);
@@ -1079,7 +1125,7 @@ async function sendOffscreenMessage<T = unknown>(message: Record<string, unknown
 }
 
 async function automationTabs(): Promise<import("./protocol").ExtensionAutomationTab[]> {
-  const tabs = await chromiumAutomationApi.attachedTabs();
+  const tabs = await chrome.tabs.query({});
   return tabs.flatMap((tab) =>
     tab.id === undefined || tab.windowId === undefined
       ? []
@@ -1098,27 +1144,43 @@ async function automationTabs(): Promise<import("./protocol").ExtensionAutomatio
 }
 
 async function ensureAutomaticPairing(force = false): Promise<RuntimeConfig | undefined> {
-  const previous = await loadConfig();
-  if (previous && !force) return previous;
+  if (automaticPairingInFlight) return automaticPairingInFlight;
+  const operation = refreshAutomaticPairing(force);
+  automaticPairingInFlight = operation;
+  try {
+    return await operation;
+  } finally {
+    if (automaticPairingInFlight === operation) automaticPairingInFlight = undefined;
+  }
+}
+
+async function refreshAutomaticPairing(force: boolean): Promise<RuntimeConfig | undefined> {
+  const previous = await loadConfigs();
   const now = Date.now();
-  if (now - automaticPairingAttemptAt < AUTOMATIC_PAIRING_RETRY_MS) return previous;
+  if (!force && now - automaticPairingAttemptAt < AUTOMATIC_PAIRING_RETRY_MS) return previous[0];
   automaticPairingAttemptAt = now;
   const installId = await loadOrCreateInstallId();
-  const record = await discoverErebus(
+  const records = await discoverErebuses(
     installId,
     "chromium",
-    chrome.runtime.getManifest().version
+    chrome.runtime.getManifest().version,
+    previous
   );
-  if (!record) return previous;
-  const next = configFromBootstrap(record, installId, previous);
-  await saveConfig(next);
-  if (
-    previous &&
-    (previous.serverUrl !== next.serverUrl || previous.token !== next.token)
-  ) {
-    activeDeliveryController?.abort();
-  }
-  return next;
+  if (records.length === 0) return previous[0];
+  const next = records.map((record) => {
+    const current = previous.find((config) => config.serverUrl === record.serverUrl && config.sessionId === record.sessionId);
+    if (current) return current;
+    const priorSession = previous.find((config) => config.sessionId === record.sessionId);
+    return configFromBootstrap(record, installId, priorSession);
+  });
+  const changed = next.some((config) => {
+    const prior = previous.find((candidate) => sameTarget(queueTarget(candidate), queueTarget(config)));
+    return !prior || prior.token !== config.token;
+  });
+  await saveConfigs(next);
+  if (changed) activeDeliveryController?.abort();
+  if (changed) restartAutomationLoop();
+  return next[0];
 }
 
 async function submitAutomationResult(
@@ -1173,7 +1235,7 @@ async function markUnexpectedDetach(tabId: number, reason: string): Promise<void
   });
   pendingRequests.delete(tabId);
   pendingSockets.delete(tabId);
-  await enqueueCaptureGap(lost, gap.reason, gap.at);
+  await enqueueCaptureGap(state.target, lost, gap.reason, gap.at);
   await persistTabs();
   await chrome.action.setBadgeBackgroundColor({ tabId, color: "#a64b3c" }).catch(() => undefined);
   await chrome.action.setBadgeText({ tabId, text: "!" }).catch(() => undefined);
@@ -1196,7 +1258,7 @@ async function closeRemovedTab(tabId: number): Promise<void> {
   pendingRequests.delete(tabId);
   pendingSockets.delete(tabId);
   await discardTabRecording(tabId);
-  await enqueueCaptureGap(lost, gap.reason, gap.at);
+  await enqueueCaptureGap(state.target, lost, gap.reason, gap.at);
   await persistTabs();
 }
 
@@ -1209,17 +1271,16 @@ async function recordQueueDrops(items: QueueItem[]): Promise<void> {
     appendGap(tabId, `queue limit discarded ${count} oldest capture event(s)`);
   }
   await persistTabs();
-  const droppedEvents = items.reduce(
-    (total, item) =>
-      total + (item.kind === "gap" ? (item.event as CaptureGapEvent).droppedEvents : 1),
-    0
-  );
-  await enqueueCaptureGap(
-    droppedEvents,
-    `capture queue limit discarded ${droppedEvents} event(s)`,
-    undefined,
-    false
-  );
+  const droppedByTarget = new Map<string, { target: QueueTarget; count: number }>();
+  for (const item of items) {
+    const key = `${item.target.serverUrl}\u0000${item.target.sessionId}\u0000${item.target.producerId}`;
+    const current = droppedByTarget.get(key) ?? { target: item.target, count: 0 };
+    current.count += item.kind === "gap" ? (item.event as CaptureGapEvent).droppedEvents : 1;
+    droppedByTarget.set(key, current);
+  }
+  for (const { target, count } of droppedByTarget.values()) {
+    await enqueueCaptureGap(target, count, `capture queue limit discarded ${count} event(s)`, undefined, false);
+  }
   await saveLastFlushError(
     `capture queue reached its limit and discarded ${items.length} oldest event(s)`
   );
@@ -1252,17 +1313,19 @@ async function recordGap(tabId: number, reason: string, droppedEvents: number): 
     gaps: [...state.gaps, { at: observedAt, reason }].slice(-MAX_GAPS_PER_TAB)
   });
   await persistTabs();
-  await enqueueCaptureGap(droppedEvents, reason, observedAt);
+  await enqueueCaptureGap(state.target, droppedEvents, reason, observedAt);
 }
 
 async function enqueueCaptureGap(
+  target: QueueTarget | undefined,
   droppedEvents: number,
   reason: string,
   observedAt = new Date().toISOString(),
   enforceLimits = true
 ): Promise<void> {
   try {
-    const { sequence, config } = await reserveSequence();
+    if (!target) return;
+    const { sequence, config } = await reserveSequence(target);
     const event: CaptureGapEvent = {
       sessionId: config.sessionId,
       source: "extension",
@@ -1347,18 +1410,34 @@ async function persistTabs(): Promise<void> {
 }
 
 async function requireConfig(): Promise<RuntimeConfig> {
-  const config = await loadConfig();
+  const config = (await loadConfigs())[0];
   if (!config) throw new Error("pair the extension with an Erebus capture session first");
   return config;
 }
 
-async function mutateConfig<T>(
-  mutation: (current: RuntimeConfig | undefined) => { config: RuntimeConfig; result: T }
+async function configForTarget(target: QueueTarget): Promise<RuntimeConfig> {
+  const config = (await loadConfigs()).find((candidate) => sameTarget(queueTarget(candidate), target));
+  if (!config) throw new Error("the capture session that owns this tab is no longer connected");
+  return config;
+}
+
+function requireTabTarget(tabId: number): QueueTarget {
+  const target = tabStates.get(tabId)?.target;
+  if (!target) throw new Error("this tab is not attached to an Erebus capture session");
+  return target;
+}
+
+function runtimeKey(config: RuntimeConfig): string {
+  return `${config.serverUrl}\u0000${config.sessionId}`;
+}
+
+async function mutateConfigs<T>(
+  mutation: (current: RuntimeConfig[]) => { configs: RuntimeConfig[]; result: T }
 ): Promise<T> {
   const operation = configMutationChain.then(async () => {
-    const current = await loadConfig();
-    const { config, result } = mutation(current);
-    await saveConfig(config);
+    const current = await loadConfigs();
+    const { configs, result } = mutation(current);
+    await saveConfigs(configs);
     return result;
   });
   configMutationChain = operation.then(

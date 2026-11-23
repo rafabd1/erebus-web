@@ -12,6 +12,9 @@ export function queueTarget(config: QueueTarget): QueueTarget {
 }
 
 export function sameTarget(left: QueueTarget, right: QueueTarget): boolean {
+  // Capture-session ids are UUIDs and identify the durable destination.
+  // The runtime port can change after a restart, so it must not split a
+  // target or strand its queued evidence on the old URL.
   return left.sessionId === right.sessionId && left.producerId === right.producerId;
 }
 

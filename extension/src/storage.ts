@@ -1,4 +1,4 @@
-import type { DeadLetter, QueueItem, QueueKind, RuntimeConfig, TabCaptureState } from "./protocol";
+import type { DeadLetter, QueueItem, QueueKind, RuntimeConfig, RuntimeSettings, TabCaptureState } from "./protocol";
 
 const DB_NAME = "erebus-web-capture";
 const DB_VERSION = 1;
@@ -214,8 +214,24 @@ export async function loadConfig(): Promise<RuntimeConfig | undefined> {
   return result[CONFIG_KEY] as RuntimeConfig | undefined;
 }
 
+export async function loadConfigs(): Promise<RuntimeConfig[]> {
+  const result = await chrome.storage.local.get([CONFIG_KEY]);
+  const value = result[CONFIG_KEY] as RuntimeConfig | RuntimeSettings | undefined;
+  if (!value) return [];
+  if (Array.isArray((value as RuntimeSettings).configs)) {
+    return (value as RuntimeSettings).configs.filter((config): config is RuntimeConfig =>
+      Boolean(config && typeof config.serverUrl === "string" && typeof config.sessionId === "string"),
+    );
+  }
+  return typeof (value as RuntimeConfig).serverUrl === "string" ? [value as RuntimeConfig] : [];
+}
+
 export async function saveConfig(config: RuntimeConfig): Promise<void> {
   await chrome.storage.local.set({ [CONFIG_KEY]: config });
+}
+
+export async function saveConfigs(configs: RuntimeConfig[]): Promise<void> {
+  await chrome.storage.local.set({ [CONFIG_KEY]: { configs } satisfies RuntimeSettings });
 }
 
 export async function loadOrCreateInstallId(): Promise<string> {
