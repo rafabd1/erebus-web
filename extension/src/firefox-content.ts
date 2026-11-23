@@ -166,21 +166,50 @@ function target(input: Record<string, unknown>): Element | null {
 }
 
 function roleOf(element: Element): string | null {
+  const explicit = element.getAttribute("role");
+  if (explicit) return explicit;
+  if (element instanceof HTMLInputElement) {
+    const type = element.type.toLowerCase();
+    if (type === "checkbox") return "checkbox";
+    if (type === "radio") return "radio";
+    if (["button", "submit", "reset", "image"].includes(type)) return "button";
+    if (type === "range") return "slider";
+    if (type === "number") return "spinbutton";
+    if (type === "search") return "searchbox";
+    if (type === "hidden") return null;
+    return "textbox";
+  }
   return (
-    element.getAttribute("role") ||
-    ({ A: "link", BUTTON: "button", INPUT: "textbox", SELECT: "combobox", TEXTAREA: "textbox" } as Record<
+    ({ A: "link", BUTTON: "button", SELECT: "combobox", TEXTAREA: "textbox" } as Record<
       string,
       string
-    >)[element.tagName] ||
-    null
+    >)[element.tagName] || null
   );
 }
 
 function nameOf(element: HTMLElement): string {
   const value = element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement ? element.value : "";
+  const labelledBy = (element.getAttribute("aria-labelledby") ?? "")
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((id) => document.getElementById(id)?.textContent ?? "")
+    .join(" ")
+    .trim();
+  const label =
+    element instanceof HTMLInputElement ||
+    element instanceof HTMLSelectElement ||
+    element instanceof HTMLTextAreaElement
+      ? Array.from(element.labels ?? [])
+          .map((item) => item.textContent ?? "")
+          .join(" ")
+          .trim()
+      : "";
   return (
     element.getAttribute("aria-label") ||
+    labelledBy ||
+    label ||
     element.getAttribute("title") ||
+    element.getAttribute("placeholder") ||
     element.innerText ||
     value ||
     element.getAttribute("name") ||

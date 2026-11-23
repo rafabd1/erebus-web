@@ -3,7 +3,7 @@
   "name": "Erebus Browser Control",
   "version": "1.0.0",
   "description": "Control selected Chromium tabs and capture their traffic in Erebus.",
-  "permissions": ["activeTab", "alarms", "debugger", "storage", "tabs"],
+  "permissions": ["activeTab", "alarms", "debugger", "offscreen", "storage", "tabs"],
   "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],
   "background": {
     "service_worker": "background.js",
