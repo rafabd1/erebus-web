@@ -177,6 +177,17 @@ CREATE TABLE IF NOT EXISTS websocket_events (
 CREATE INDEX IF NOT EXISTS idx_websocket_events_connection
 ON websocket_events(connection_id, captured_at, sequence);
 
+-- The startup orphan-blob sweep checks body hashes with correlated NOT EXISTS
+-- subqueries. Without these indexes every blob scans the full variant tables,
+-- which takes minutes on a large traffic store and makes the runtime miss its
+-- startup timeout.
+CREATE INDEX IF NOT EXISTS idx_request_variants_body_hash
+ON request_variants(body_hash);
+CREATE INDEX IF NOT EXISTS idx_response_variants_body_hash
+ON response_variants(body_hash);
+CREATE INDEX IF NOT EXISTS idx_websocket_events_payload_hash
+ON websocket_events(payload_hash);
+
 CREATE TABLE IF NOT EXISTS websocket_search_fallback (
     event_id TEXT PRIMARY KEY REFERENCES websocket_events(id) ON DELETE CASCADE,
     url TEXT NOT NULL,

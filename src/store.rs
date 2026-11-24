@@ -3897,4 +3897,25 @@ mod tests {
         assert!(store.graph(GraphQuery::default()).unwrap().nodes.is_empty());
         assert!(store.annotation(&graph_annotation.id).unwrap().is_none());
     }
+
+    #[test]
+    fn orphan_blob_sweep_indexes_are_present() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let connection = store.writer().unwrap();
+        for (table, index) in [
+            ("request_variants", "idx_request_variants_body_hash"),
+            ("response_variants", "idx_response_variants_body_hash"),
+            ("websocket_events", "idx_websocket_events_payload_hash"),
+        ] {
+            let exists: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_index_list(?1) WHERE name = ?2",
+                    params![table, index],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "missing index {index} on {table}");
+        }
+    }
 }
