@@ -131,6 +131,96 @@ async function execute(
   }
 
   const tabId = requiredTabId(command);
+  if (command.operation === "sessionExport") {
+    const tab = await api.getTab(tabId);
+    if (!tab.url || !/^https?:/i.test(tab.url)) {
+      throw new Error("Session export requires an http or https tab.");
+    }
+    await api.ensureAttached(tabId);
+    await api.sendCommand(tabId, "Network.enable");
+    const cookieResult = await api.sendCommand(tabId, "Network.getCookies", {
+      urls: [tab.url],
+    });
+    const rawCookies = Array.isArray(cookieResult.cookies) ? cookieResult.cookies : [];
+    const cookies = rawCookies.flatMap((cookie) => {
+      if (typeof cookie !== "object" || cookie === null) return [];
+      const record = cookie as Record<string, unknown>;
+      if (typeof record.name !== "string" || typeof record.value !== "string") return [];
+      const sameSite =
+        record.sameSite === "Strict" || record.sameSite === "Lax" || record.sameSite === "None"
+          ? record.sameSite
+          : undefined;
+      return [
+        {
+          name: record.name,
+          value: record.value,
+          domain: typeof record.domain === "string" ? record.domain : "",
+          path: typeof record.path === "string" ? record.path : "/",
+          ...(typeof record.expires === "number" && record.expires >= 0
+            ? { expires: record.expires }
+            : {}),
+          ...(typeof record.httpOnly === "boolean" ? { httpOnly: record.httpOnly } : {}),
+          ...(typeof record.secure === "boolean" ? { secure: record.secure } : {}),
+          ...(sameSite ? { sameSite } : {}),
+        },
+      ];
+    });
+
+    let origins: Array<{
+      origin: string;
+      localStorage: Record<string, string>;
+      sessionStorage?: Record<string, string>;
+    }> = [];
+    try {
+      const storageResult = await api.sendCommand(tabId, "Runtime.evaluate", {
+        expression: `(() => {
+          const read = (storage) => {
+            const out = {};
+            for (let i = 0; i < storage.length; i += 1) {
+              const key = storage.key(i);
+              if (key !== null) out[key] = storage.getItem(key) ?? "";
+            }
+            return out;
+          };
+          return {
+            origin: location.origin,
+            localStorage: read(localStorage),
+            sessionStorage: read(sessionStorage)
+          };
+        })()`,
+        returnByValue: true,
+        awaitPromise: false,
+      });
+      const value = (storageResult.result as { value?: unknown } | undefined)?.value;
+      if (typeof value === "object" && value !== null) {
+        const record = value as Record<string, unknown>;
+        if (
+          typeof record.origin === "string" &&
+          typeof record.localStorage === "object" &&
+          record.localStorage !== null
+        ) {
+          origins = [
+            {
+              origin: record.origin,
+              localStorage: record.localStorage as Record<string, string>,
+              ...(typeof record.sessionStorage === "object" && record.sessionStorage !== null
+                ? { sessionStorage: record.sessionStorage as Record<string, string> }
+                : {}),
+            },
+          ];
+        }
+      }
+    } catch {
+      origins = [];
+    }
+
+    return {
+      url: tab.url,
+      ...(tab.title ? { title: tab.title } : {}),
+      cookies,
+      origins,
+    };
+  }
   if (command.operation === "navigate") {
     const url = requiredString(input.url, "url");
     const tab = await api.getTab(tabId);
