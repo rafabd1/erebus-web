@@ -195,3 +195,71 @@ describe("extension automation navigation", () => {
     });
   });
 });
+
+describe("extension session export", () => {
+  it("returns cookies and the tab origin storage", async () => {
+    const { automationApi } = api("https://example.com/account");
+    automationApi.sendCommand = vi.fn(async (_tabId, method) => {
+      if (method === "Network.getCookies") {
+        return {
+          cookies: [
+            {
+              name: "sid",
+              value: "secret",
+              domain: ".example.com",
+              path: "/",
+              secure: true,
+              httpOnly: true,
+              sameSite: "Lax",
+              expires: 1_700_000_000
+            }
+          ]
+        };
+      }
+      if (method === "Runtime.evaluate") {
+        return {
+          result: {
+            value: {
+              origin: "https://example.com",
+              localStorage: { theme: "dark" },
+              sessionStorage: { step: "2" }
+            }
+          }
+        };
+      }
+      return {};
+    });
+
+    const result = await executeChromiumAutomationCommand(
+      command("sessionExport", {}, 31),
+      automationApi
+    );
+
+    expect(result).toEqual({
+      commandId: "command-sessionExport",
+      ok: true,
+      result: {
+        url: "https://example.com/account",
+        cookies: [
+          {
+            name: "sid",
+            value: "secret",
+            domain: ".example.com",
+            path: "/",
+            expires: 1_700_000_000,
+            httpOnly: true,
+            secure: true,
+            sameSite: "Lax"
+          }
+        ],
+        origins: [
+          {
+            origin: "https://example.com",
+            localStorage: { theme: "dark" },
+            sessionStorage: { step: "2" }
+          }
+        ]
+      }
+    });
+  });
+});
