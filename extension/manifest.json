@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Erebus Browser Control",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Control selected Chromium tabs and capture their traffic in Erebus.",
   "permissions": ["activeTab", "alarms", "debugger", "offscreen", "storage", "tabs"],
   "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],
